@@ -17,7 +17,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,7 +51,7 @@ fun QuickToolbar(
                 modifier = Modifier
                     .padding(bottom = 8.dp)
                     .clip(RoundedCornerShape(16.dp))
-                    .background(SurfaceDark.copy(alpha = 0.92f))
+                    .background(SurfaceDark.copy(alpha = 0.95f))
                     .padding(horizontal = 8.dp, vertical = 6.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -63,6 +62,8 @@ fun QuickToolbar(
                 KeyButton("Tab") { connection.sendKeyClick(KeyCode.Tab) }
                 KeyButton("Enter") { connection.sendKeyClick(KeyCode.Enter) }
                 KeyButton("Bksp") { connection.sendKeyClick(KeyCode.Backspace) }
+                KeyButton("▲ Scroll") { connection.sendMouseScroll(0, 120) }
+                KeyButton("▼ Scroll") { connection.sendMouseScroll(0, -120) }
                 KeyButton("Copy") {
                     connection.sendKeyDown(KeyCode.Control)
                     connection.sendKeyClick(KeyCode.Unicode('c'))
@@ -81,7 +82,7 @@ fun QuickToolbar(
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(28.dp))
-                .background(SurfaceDark.copy(alpha = 0.92f))
+                .background(SurfaceDark.copy(alpha = 0.95f))
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -119,11 +120,18 @@ fun QuickToolbar(
                 onClick = { connection.sendMouseClick(MouseBtn.RIGHT) }
             )
 
-            // Touch mode toggle (Trackpad vs Direct)
+            // Double Click
+            ToolbarButton(
+                icon = Icons.Default.FilterNone,
+                label = "D-Click",
+                onClick = { connection.sendMouseDoubleClick(MouseBtn.LEFT) }
+            )
+
+            // Touch mode toggle (Direct Touch vs Trackpad)
             ToolbarButton(
                 icon = if (isDirectTouch) Icons.Default.Fingerprint else Icons.Default.Mouse,
                 label = if (isDirectTouch) "Direct" else "Trackpad",
-                accent = isDirectTouch,
+                accent = true,
                 onClick = onToggleTouchMode
             )
 

@@ -20,6 +20,14 @@
 rust-remote-pc/
 ├── Cargo.toml
 ├── README.md
+├── android-client/          # অ্যান্ড্রয়েড মোবাইল ক্লায়েন্ট (Kotlin & Jetpack Compose)
+│   ├── app/
+│   │   ├── build.gradle.kts
+│   │   └── src/main/java/com/remote/rustpc/
+│   │       ├── data/        # প্রোটোকল মডেল ও প্রিফারেন্সেস
+│   │       ├── network/     # TCP সকেট ও বাইনারি কোডেক
+│   │       └── ui/          # কম্পোজ স্ক্রিন ও ক্যানভাস ভিউয়ার
+│   └── README.md
 └── src/
     ├── main.rs              # CLI সাব-কমান্ড ও GUI লঞ্চার
     ├── common/              # শেয়ার্ড প্রোটোকল ও ক্রিপ্টো
@@ -65,6 +73,11 @@ cargo run --release -- client
 # অথবা কমান্ড লাইনেই কানেকশন ডিটেইলস পাস করুন:
 cargo run --release -- client --host 100.101.102.103:5885 --password "mysecret123"
 ```
+
+### ৩. Android মোবাইল অ্যাপ চালানো (মোবাইলে স্ক্রিন দেখতে):
+1. `android-client/app/build/outputs/apk/debug/app-debug.apk` ফোনে ইনস্টল করুন।
+2. পিসির Tailscale IP এবং Password দিয়ে **"Connect to PC"** বাটনে ট্যাপ করুন।
+3. মোবাইল স্ক্রিনে পিসির ডিসপ্লে লাইভ স্ট্রিম হবে এবং মাউস/কিবোর্ড দিয়ে কন্ট্রোল করতে পারবেন।
 
 ---
 

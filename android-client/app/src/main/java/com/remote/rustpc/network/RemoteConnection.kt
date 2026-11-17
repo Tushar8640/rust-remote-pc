@@ -2,8 +2,10 @@ package com.remote.rustpc.network
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Log
 import com.remote.rustpc.data.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -11,7 +13,6 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.ConcurrentLinkedQueue
 
 sealed class ConnectionState {
     data object Disconnected : ConnectionState()
@@ -31,6 +32,8 @@ data class ConnectionStats(
 
 class RemoteConnection(private val coroutineScope: CoroutineScope) {
 
+    private val tag = "RemoteConnection"
+
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -41,14 +44,12 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     val stats: StateFlow<ConnectionStats> = _stats.asStateFlow()
 
     private var socket: Socket? = null
-    private var outputStream: BufferedOutputStream? = null
-    private var inputStream: BufferedInputStream? = null
-
     private var connectionJob: Job? = null
     private var pingJob: Job? = null
+    private var writeJob: Job? = null
 
-    private val outgoingQueue = ConcurrentLinkedQueue<Packet>()
-    private var isWriting = false
+    // Channel for thread-safe sequential packet writing
+    private var outgoingChannel = Channel<Packet>(Channel.UNLIMITED)
 
     // FPS calculation state
     private var frameCountInWindow = 0
@@ -62,20 +63,21 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
 
         disconnect()
 
+        outgoingChannel = Channel(Channel.UNLIMITED)
+
         connectionJob = coroutineScope.launch(Dispatchers.IO) {
             try {
+                Log.d(tag, "Connecting to $host:$port...")
                 _connectionState.value = ConnectionState.Connecting
 
                 val sock = Socket()
                 sock.tcpNoDelay = true
-                sock.soTimeout = 15000 // 15s socket timeout
+                sock.soTimeout = 15000 // 15s handshake timeout
                 sock.connect(InetSocketAddress(host, port), 8000)
 
                 socket = sock
                 val out = BufferedOutputStream(sock.getOutputStream(), 64 * 1024)
                 val inp = BufferedInputStream(sock.getInputStream(), 256 * 1024)
-                outputStream = out
-                inputStream = inp
 
                 // 1. Send AuthRequest
                 _connectionState.value = ConnectionState.Authenticating
@@ -98,6 +100,8 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                     throw IllegalStateException(responsePacket.message.ifBlank { "Authentication failed" })
                 }
 
+                Log.d(tag, "Authenticated! Remote screen: ${responsePacket.screenWidth}x${responsePacket.screenHeight}")
+
                 _connectionState.value = ConnectionState.Connected(
                     responsePacket.screenWidth,
                     responsePacket.screenHeight
@@ -107,11 +111,24 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                     screenHeight = responsePacket.screenHeight
                 )
 
+                // Start dedicated packet writer coroutine
+                writeJob = launch(Dispatchers.IO) {
+                    try {
+                        for (packet in outgoingChannel) {
+                            val bytes = ProtocolCodec.encodePacket(packet)
+                            out.write(bytes)
+                            out.flush()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(tag, "Write error: ${e.message}")
+                    }
+                }
+
                 // Start ping / keepalive job
                 startPingJob()
 
-                // Streaming read loop
-                sock.soTimeout = 0 // Infinite read timeout during active session
+                // Active streaming read loop
+                sock.soTimeout = 0 // Infinite read timeout
                 val decodeOptions = BitmapFactory.Options().apply {
                     inPreferredConfig = Bitmap.Config.ARGB_8888
                 }
@@ -136,6 +153,7 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                 }
 
             } catch (e: Exception) {
+                Log.e(tag, "Connection error: ${e.message}", e)
                 if (isActive) {
                     _connectionState.value = ConnectionState.Error(e.message ?: "Connection error")
                 }
@@ -196,11 +214,15 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     }
 
     fun sendMouseClick(button: MouseBtn) {
-        coroutineScope.launch(Dispatchers.IO) {
-            sendMouseDown(button)
-            delay(25)
-            sendMouseUp(button)
-        }
+        sendMouseDown(button)
+        sendMouseUp(button)
+    }
+
+    fun sendMouseDoubleClick(button: MouseBtn) {
+        sendMouseDown(button)
+        sendMouseUp(button)
+        sendMouseDown(button)
+        sendMouseUp(button)
     }
 
     fun sendMouseScroll(deltaX: Int, deltaY: Int) {
@@ -216,19 +238,13 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     }
 
     fun sendKeyClick(key: KeyCode) {
-        coroutineScope.launch(Dispatchers.IO) {
-            sendKeyDown(key)
-            delay(20)
-            sendKeyUp(key)
-        }
+        sendKeyDown(key)
+        sendKeyUp(key)
     }
 
     fun sendText(text: String) {
-        coroutineScope.launch(Dispatchers.IO) {
-            for (char in text) {
-                sendKeyClick(KeyCode.Unicode(char))
-                delay(10)
-            }
+        for (char in text) {
+            sendKeyClick(KeyCode.Unicode(char))
         }
     }
 
@@ -237,38 +253,14 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     }
 
     fun sendPacket(packet: Packet) {
-        outgoingQueue.add(packet)
-        flushOutgoing()
-    }
-
-    @Synchronized
-    private fun flushOutgoing() {
-        if (isWriting) return
-        isWriting = true
-
-        coroutineScope.launch(Dispatchers.IO) {
-            try {
-                val out = outputStream ?: return@launch
-                while (outgoingQueue.isNotEmpty()) {
-                    val pkt = outgoingQueue.poll() ?: break
-                    val bytes = ProtocolCodec.encodePacket(pkt)
-                    out.write(bytes)
-                }
-                out.flush()
-            } catch (e: Exception) {
-                // Socket write failed
-            } finally {
-                isWriting = false
-                if (outgoingQueue.isNotEmpty()) {
-                    flushOutgoing()
-                }
-            }
-        }
+        outgoingChannel.trySend(packet)
     }
 
     fun disconnect() {
         pingJob?.cancel()
+        writeJob?.cancel()
         connectionJob?.cancel()
+        outgoingChannel.close()
         cleanupSocket()
         _connectionState.value = ConnectionState.Disconnected
         _latestBitmap.value = null
@@ -277,17 +269,8 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
 
     private fun cleanupSocket() {
         try {
-            outputStream?.close()
-        } catch (_: Exception) {}
-        try {
-            inputStream?.close()
-        } catch (_: Exception) {}
-        try {
             socket?.close()
         } catch (_: Exception) {}
-
         socket = null
-        outputStream = null
-        inputStream = null
     }
 }
