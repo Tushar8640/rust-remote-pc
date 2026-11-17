@@ -106,9 +106,9 @@ fn launch_unified_gui(
 ) -> Result<(), anyhow::Error> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([880.0, 620.0])
-            .with_title("Rust Remote Desktop • Ultra-Low Latency P2P"),
+            .with_inner_size([900.0, 640.0])
+            .with_min_inner_size([640.0, 480.0])
+            .with_title("Remote Desktop"),
         ..Default::default()
     };
 
