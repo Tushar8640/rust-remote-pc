@@ -1,0 +1,51 @@
+[package]
+name = "rust-remote-pc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Imran"]
+description = "High-performance, low-latency Rust remote desktop over Tailscale"
+
+[dependencies]
+# Async runtime & networking
+tokio = { version = "1.38", features = ["full"] }
+bytes = "1.6"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Screen capture
+xcap = "0.0.14"
+
+# Input simulation
+enigo = "0.2"
+
+# Image compression / decoding
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# GUI viewer
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.28"
+
+# Logging & error handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Clipboard
+arboard = "3.4"
+
+# Crypto / Auth
+sha2 = "0.10"
+hex = "0.4"
+
+# Optional H264 feature for openh264
+openh264 = { version = "0.6", optional = true }
+
+[features]
+default = []
+h264 = ["dep:openh264"]

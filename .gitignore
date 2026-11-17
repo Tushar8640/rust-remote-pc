@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Android Gradle ignores
+.gradle/
+**/build/
+android-client/.gradle/
+android-client/**/build/
+*.iml
+.idea/
+local.properties
