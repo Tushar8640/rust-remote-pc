@@ -2,8 +2,6 @@ package com.remote.rustpc.ui.components
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
@@ -15,17 +13,28 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.dp
 import com.remote.rustpc.data.MouseBtn
 import com.remote.rustpc.network.RemoteConnection
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
+private const val LONG_PRESS_MS = 550L
+private const val DOUBLE_TAP_MS = 350L
+private const val DOUBLE_TAP_SLOP_PX = 60f
+private const val SCROLL_STEP_PX = 28f
+
+/**
+ * Remote screen with touch input.
+ *
+ * Direct touch:  tap = click, double tap = double click, long press = right click,
+ *                drag = left-button drag, two fingers = pinch zoom / pan.
+ * Trackpad:      drag moves the cursor, tap = click, long press = right click,
+ *                two fingers = scroll (or zoom when pinching).
+ */
 @Composable
 fun RemoteCanvas(
     bitmap: Bitmap?,
@@ -42,125 +51,157 @@ fun RemoteCanvas(
     var cursorRatioX by remember { mutableFloatStateOf(0.5f) }
     var cursorRatioY by remember { mutableFloatStateOf(0.5f) }
 
+    // The gesture loop is started once; it always reads the latest values through these.
+    val directState by rememberUpdatedState(isDirectTouch)
+    val bitmapState by rememberUpdatedState(bitmap)
+    val scaleState by rememberUpdatedState(scale)
+    val offsetState by rememberUpdatedState(offset)
+    val transformState by rememberUpdatedState(onTransform)
+
     Box(
         modifier = modifier
             .fillMaxSize()
-            .pointerInput(isDirectTouch, bitmap, canvasSize, scale, offset) {
+            .pointerInput(Unit) {
+                val slop = viewConfiguration.touchSlop * 1.5f
+
                 awaitPointerEventScope {
                     var downTime = 0L
                     var downPos = Offset.Zero
-                    var isDragging = false
+                    var dragging = false     // left button currently held on the host
+                    var multi = false        // a multi-finger gesture is in progress
                     var lastTapTime = 0L
+                    var lastTapPos = Offset.Zero
+                    var scrollAccum = 0f
+
+                    fun ratioOf(p: Offset) =
+                        calculateScreenRatio(p, canvasSize, bitmapState, scaleState, offsetState)
+
+                    fun inside(r: Pair<Float, Float>) = r.first in 0f..1f && r.second in 0f..1f
 
                     while (true) {
                         val event = awaitPointerEvent()
                         val changes = event.changes
-
                         if (changes.isEmpty()) continue
+                        val pressedCount = changes.count { it.pressed }
 
-                        if (changes.size >= 2) {
-                            // 2-finger gesture: Zoom & Pan
+                        // ── Two or more fingers: zoom / pan / scroll ──
+                        if (pressedCount >= 2) {
+                            if (!multi) {
+                                multi = true
+                                if (dragging) {
+                                    connection.sendMouseUp(MouseBtn.LEFT)
+                                    dragging = false
+                                }
+                                scrollAccum = 0f
+                            }
                             val zoom = event.calculateZoom()
                             val pan = event.calculatePan()
-                            if (zoom != 1f || pan != Offset.Zero) {
-                                onTransform(zoom, pan)
-                                changes.forEach { it.consume() }
+                            val pinching = abs(zoom - 1f) > 0.015f
+
+                            if (!directState && scaleState <= 1.01f && !pinching) {
+                                // Trackpad: two-finger drag scrolls the remote page.
+                                scrollAccum += pan.y
+                                while (abs(scrollAccum) >= SCROLL_STEP_PX) {
+                                    val dir = if (scrollAccum > 0) 1 else -1
+                                    connection.sendMouseScroll(0, 120 * dir)
+                                    scrollAccum -= SCROLL_STEP_PX * dir
+                                }
+                            } else if (zoom != 1f || pan != Offset.Zero) {
+                                transformState(zoom, pan)
                             }
+                            changes.forEach { it.consume() }
                             continue
                         }
 
-                        // Single finger gesture
+                        // After a multi-finger gesture, ignore the remaining finger until all lift.
+                        if (multi) {
+                            if (pressedCount == 0) multi = false
+                            changes.forEach { it.consume() }
+                            continue
+                        }
+
                         val change = changes[0]
 
                         if (change.pressed && !change.previousPressed) {
-                            // Finger Down
+                            // Finger down
                             downTime = System.currentTimeMillis()
                             downPos = change.position
-                            isDragging = false
-
-                            if (isDirectTouch) {
-                                val (rx, ry) = calculateScreenRatio(downPos, canvasSize, bitmap, scale, offset)
-                                if (rx in 0f..1f && ry in 0f..1f) {
-                                    connection.sendMouseMove(rx, ry)
-                                }
+                            dragging = false
+                            if (directState) {
+                                val r = ratioOf(downPos)
+                                if (inside(r)) connection.sendMouseMove(r.first, r.second)
                             }
                             change.consume()
                         } else if (change.pressed && change.previousPressed) {
-                            // Finger Moved
+                            // Finger moved
                             val dist = hypot(
                                 (change.position.x - downPos.x).toDouble(),
                                 (change.position.y - downPos.y).toDouble()
                             ).toFloat()
 
-                            if (dist > 18f) {
-                                isDragging = true
-                            }
-
-                            if (isDirectTouch) {
-                                val (rx, ry) = calculateScreenRatio(change.position, canvasSize, bitmap, scale, offset)
-                                if (rx in 0f..1f && ry in 0f..1f) {
-                                    if (isDragging) {
-                                        // Send mouse down if starting drag
+                            if (directState) {
+                                if (!dragging && dist > slop) {
+                                    // Begin a left-button drag where the finger first touched.
+                                    val start = ratioOf(downPos)
+                                    if (inside(start)) {
+                                        connection.sendMouseMove(start.first, start.second)
                                         connection.sendMouseDown(MouseBtn.LEFT)
+                                        dragging = true
                                     }
-                                    connection.sendMouseMove(rx, ry)
                                 }
-                            } else {
-                                // Trackpad mode: move cursor relatively
-                                val pan = change.positionChange()
-                                val sensitivity = 0.0018f / scale.coerceAtLeast(1f)
+                                if (dragging) {
+                                    val r = ratioOf(change.position)
+                                    connection.sendMouseMove(
+                                        r.first.coerceIn(0f, 1f),
+                                        r.second.coerceIn(0f, 1f)
+                                    )
+                                }
+                            } else if (dist > slop || dragging) {
+                                // Trackpad: relative cursor movement
+                                dragging = true // reused as "moved beyond slop" flag
+                                val pan = change.position - change.previousPosition
+                                val sensitivity = 0.0018f / scaleState.coerceAtLeast(1f)
                                 cursorRatioX = (cursorRatioX + pan.x * sensitivity).coerceIn(0f, 1f)
                                 cursorRatioY = (cursorRatioY + pan.y * sensitivity).coerceIn(0f, 1f)
                                 connection.sendMouseMove(cursorRatioX, cursorRatioY)
                             }
                             change.consume()
                         } else if (!change.pressed && change.previousPressed) {
-                            // Finger Released (Up)
-                            val elapsed = System.currentTimeMillis() - downTime
+                            // Finger up
+                            val now = System.currentTimeMillis()
+                            val elapsed = now - downTime
+                            val moved = dragging
 
-                            if (isDirectTouch) {
-                                if (isDragging) {
-                                    connection.sendMouseUp(MouseBtn.LEFT)
-                                } else {
-                                    // Tap or Long press
-                                    val (rx, ry) = calculateScreenRatio(downPos, canvasSize, bitmap, scale, offset)
-                                    if (rx in 0f..1f && ry in 0f..1f) {
-                                        connection.sendMouseMove(rx, ry)
+                            if (directState && moved) {
+                                connection.sendMouseUp(MouseBtn.LEFT)
+                            } else if (!moved) {
+                                // A tap (no meaningful movement)
+                                val canClick = if (directState) {
+                                    val r = ratioOf(downPos)
+                                    if (inside(r)) connection.sendMouseMove(r.first, r.second)
+                                    inside(r)
+                                } else true
 
-                                        if (elapsed >= 550) {
-                                            // Long press -> Right Click
-                                            connection.sendMouseClick(MouseBtn.RIGHT)
-                                        } else {
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastTapTime < 350) {
-                                                // Double tap
-                                                connection.sendMouseDoubleClick(MouseBtn.LEFT)
-                                                lastTapTime = 0L
-                                            } else {
-                                                // Single click
-                                                connection.sendMouseClick(MouseBtn.LEFT)
-                                                lastTapTime = now
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Trackpad Mode Release
-                                if (!isDragging) {
-                                    if (elapsed >= 550) {
+                                if (canClick) {
+                                    if (elapsed >= LONG_PRESS_MS) {
                                         connection.sendMouseClick(MouseBtn.RIGHT)
+                                        lastTapTime = 0L
                                     } else {
-                                        val now = System.currentTimeMillis()
-                                        if (now - lastTapTime < 350) {
-                                            connection.sendMouseDoubleClick(MouseBtn.LEFT)
-                                            lastTapTime = 0L
-                                        } else {
-                                            connection.sendMouseClick(MouseBtn.LEFT)
-                                            lastTapTime = now
-                                        }
+                                        // Each tap is a plain click. Two quick taps in the same
+                                        // place reach the host as two clicks, which Windows treats
+                                        // as a double-click.
+                                        connection.sendMouseClick(MouseBtn.LEFT)
+                                        val isSecond = now - lastTapTime < DOUBLE_TAP_MS &&
+                                            hypot(
+                                                (downPos.x - lastTapPos.x).toDouble(),
+                                                (downPos.y - lastTapPos.y).toDouble()
+                                            ) < DOUBLE_TAP_SLOP_PX
+                                        lastTapTime = if (isSecond) 0L else now
+                                        lastTapPos = downPos
                                     }
                                 }
                             }
+                            dragging = false
                             change.consume()
                         }
                     }
@@ -168,7 +209,7 @@ fun RemoteCanvas(
             }
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
-            canvasSize = size.let { IntSize(it.width.roundToInt(), it.height.roundToInt()) }
+            canvasSize = IntSize(size.width.roundToInt(), size.height.roundToInt())
 
             if (bitmap != null && !bitmap.isRecycled) {
                 val imageBitmap = bitmap.asImageBitmap()
@@ -190,23 +231,22 @@ fun RemoteCanvas(
                 val finalX = baseOffsetX + offset.x - (finalWidth - baseDstWidth) / 2f
                 val finalY = baseOffsetY + offset.y - (finalHeight - baseDstHeight) / 2f
 
-                // Draw remote screen
                 drawImage(
                     image = imageBitmap,
                     dstOffset = IntOffset(finalX.roundToInt(), finalY.roundToInt()),
                     dstSize = IntSize(finalWidth.roundToInt(), finalHeight.roundToInt())
                 )
 
-                // If in Trackpad mode, draw a sleek cursor pointer
+                // Trackpad mode: draw a cursor pointer
                 if (!isDirectTouch) {
-                    val cursorScreenX = finalX + cursorRatioX * finalWidth
-                    val cursorScreenY = finalY + cursorRatioY * finalHeight
+                    val cx = finalX + cursorRatioX * finalWidth
+                    val cy = finalY + cursorRatioY * finalHeight
 
                     val cursorPath = Path().apply {
-                        moveTo(cursorScreenX, cursorScreenY)
-                        lineTo(cursorScreenX + 18f, cursorScreenY + 14f)
-                        lineTo(cursorScreenX + 8f, cursorScreenY + 16f)
-                        lineTo(cursorScreenX + 5f, cursorScreenY + 24f)
+                        moveTo(cx, cy)
+                        lineTo(cx + 18f, cy + 14f)
+                        lineTo(cx + 8f, cy + 16f)
+                        lineTo(cx + 5f, cy + 24f)
                         close()
                     }
                     drawPath(cursorPath, Color.White)
@@ -218,7 +258,8 @@ fun RemoteCanvas(
 }
 
 /**
- * Calculates normalized (0.0 .. 1.0) remote screen coordinate for a touch position
+ * Normalised (0..1) remote-screen coordinate for a touch position, accounting for
+ * letterboxing, zoom and pan. Values outside 0..1 mean the touch is off the image.
  */
 private fun calculateScreenRatio(
     touchPos: Offset,
@@ -227,7 +268,7 @@ private fun calculateScreenRatio(
     scale: Float,
     offset: Offset
 ): Pair<Float, Float> {
-    if (bitmap == null || canvasSize.width == 0 || canvasSize.height == 0) return 0f to 0f
+    if (bitmap == null || canvasSize.width == 0 || canvasSize.height == 0) return -1f to -1f
 
     val viewWidth = canvasSize.width.toFloat()
     val viewHeight = canvasSize.height.toFloat()
@@ -246,8 +287,5 @@ private fun calculateScreenRatio(
     val finalX = baseOffsetX + offset.x - (finalWidth - baseDstWidth) / 2f
     val finalY = baseOffsetY + offset.y - (finalHeight - baseDstHeight) / 2f
 
-    val xRatio = (touchPos.x - finalX) / finalWidth
-    val yRatio = (touchPos.y - finalY) / finalHeight
-
-    return xRatio to yRatio
+    return ((touchPos.x - finalX) / finalWidth) to ((touchPos.y - finalY) / finalHeight)
 }

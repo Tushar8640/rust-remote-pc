@@ -30,6 +30,11 @@
    - স্পেশাল উইন্ডোজ কি: **Windows Key (Win)**, **Esc**, **Enter**, **Backspace**, **Tab**, **Ctrl+C (Copy)**, **Ctrl+V (Paste)**।
    - ডিসকানেক্ট বাটন।
 
+5a. **Host Audio ও Full Screen:**
+   - পিসির সাউন্ড (system audio) ফোনে বাজে। টুলবারে Sound বাটনে mute/unmute, "More" প্যানেলে volume slider।
+   - পিসিতে "Share audio" চালু থাকতে হবে (ডিফল্ট চালু)।
+   - Full screen বাটনে স্ট্যাটাস/নেভিগেশন বার লুকায় (কানেক্ট করলে ডিফল্ট full screen); Rotate বাটনে landscape লক।
+
 6. **Screen Keep-Alive:**
    - রিমোট স্ক্রিন দেখার সময় ফোনের স্ক্রিন বন্ধ/স্লিপ হয়ে যাওয়া বন্ধ রাখে।
 

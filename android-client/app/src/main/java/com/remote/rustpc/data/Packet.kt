@@ -25,7 +25,8 @@ enum class MouseBtn(val id: Int) {
  * KeyCode matching Rust KeyCode enum
  */
 sealed class KeyCode(val variantIndex: Int) {
-    data class Unicode(val char: Char) : KeyCode(0)
+    /** A Unicode scalar value (code point). Serialized as UTF-8, like Rust's `char` in bincode. */
+    data class Unicode(val codePoint: Int) : KeyCode(0)
     data object Backspace : KeyCode(1)
     data object Tab : KeyCode(2)
     data object Enter : KeyCode(3)
@@ -92,4 +93,11 @@ sealed class Packet(val variantIndex: Int) {
     data class Ping(val timestampMs: Long) : Packet(5)
 
     data class Pong(val timestampMs: Long) : Packet(6)
+
+    /** Host system audio: interleaved signed 16-bit little-endian PCM, 1 or 2 channels. */
+    class Audio(
+        val sampleRate: Int,
+        val channels: Int,
+        val data: ByteArray
+    ) : Packet(7)
 }

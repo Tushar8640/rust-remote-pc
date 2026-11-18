@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@android:drawable/ic_menu_slideshow"
         android:label="Rust Remote PC"
         android:roundIcon="@android:drawable/ic_menu_slideshow"

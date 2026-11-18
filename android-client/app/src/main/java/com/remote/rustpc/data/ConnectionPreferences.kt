@@ -3,27 +3,32 @@ package com.remote.rustpc.data
 import android.content.Context
 import android.content.SharedPreferences
 
-data class SavedConnection(
-    val host: String,
-    val port: Int,
-    val label: String
-)
-
 class ConnectionPreferences(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("rust_remote_pc_prefs", Context.MODE_PRIVATE)
 
     var lastHost: String
-        get() = prefs.getString("last_host", "100.100.100.100") ?: "100.100.100.100"
+        get() = prefs.getString("last_host", "") ?: ""
         set(value) = prefs.edit().putString("last_host", value).apply()
 
     var lastPort: Int
         get() = prefs.getInt("last_port", DEFAULT_PORT)
         set(value) = prefs.edit().putInt("last_port", value).apply()
 
+    /** The password is only stored when the user opts in. Off by default. */
+    var rememberPassword: Boolean
+        get() = prefs.getBoolean("remember_password", false)
+        set(value) {
+            val e = prefs.edit().putBoolean("remember_password", value)
+            if (!value) e.remove("last_password")
+            e.apply()
+        }
+
     var lastPassword: String
-        get() = prefs.getString("last_password", "") ?: ""
-        set(value) = prefs.edit().putString("last_password", value).apply()
+        get() = if (rememberPassword) prefs.getString("last_password", "") ?: "" else ""
+        set(value) {
+            if (rememberPassword) prefs.edit().putString("last_password", value).apply()
+        }
 
     fun getRecentHosts(): List<String> {
         val raw = prefs.getString("recent_hosts", "") ?: ""
@@ -34,7 +39,11 @@ class ConnectionPreferences(context: Context) {
         val list = getRecentHosts().toMutableList()
         list.remove(host)
         list.add(0, host)
-        val trimmed = list.take(5)
-        prefs.edit().putString("recent_hosts", trimmed.joinToString(",")).apply()
+        prefs.edit().putString("recent_hosts", list.take(5).joinToString(",")).apply()
+    }
+
+    fun removeRecentHost(host: String) {
+        val list = getRecentHosts().filter { it != host }
+        prefs.edit().putString("recent_hosts", list.joinToString(",")).apply()
     }
 }

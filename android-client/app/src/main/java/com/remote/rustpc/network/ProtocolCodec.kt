@@ -85,6 +85,12 @@ object ProtocolCodec {
             is Packet.Pong -> {
                 writeU64LE(out, packet.timestampMs)
             }
+            is Packet.Audio -> {
+                writeU32LE(out, packet.sampleRate)
+                out.write(packet.channels and 0xFF)
+                out.write((packet.channels shr 8) and 0xFF)
+                writeBytes(out, packet.data)
+            }
         }
     }
 
@@ -118,8 +124,9 @@ object ProtocolCodec {
         writeU32LE(out, key.variantIndex)
         when (key) {
             is KeyCode.Unicode -> {
-                // In Rust serde char is 4 bytes LE Unicode scalar
-                writeU32LE(out, key.char.code)
+                // bincode serializes a Rust `char` as its UTF-8 encoding (1-4 bytes),
+                // NOT as a 4-byte scalar value.
+                out.write(String(Character.toChars(key.codePoint)).toByteArray(Charsets.UTF_8))
             }
             is KeyCode.F -> {
                 out.write(key.num and 0xFF)
@@ -199,6 +206,12 @@ object ProtocolCodec {
                 val ts = inBuf.long
                 Packet.Pong(ts)
             }
+            7 -> {
+                val rate = inBuf.int
+                val channels = inBuf.short.toInt() and 0xFFFF
+                val data = readBytes(inBuf)
+                Packet.Audio(rate, channels, data)
+            }
             else -> throw IllegalStateException("Unknown packet variant index: $variantIndex")
         }
     }
@@ -239,7 +252,7 @@ object ProtocolCodec {
     private fun readKeyCode(buf: ByteBuffer): KeyCode {
         val idx = buf.int
         return when (idx) {
-            0 -> KeyCode.Unicode(buf.int.toChar())
+            0 -> KeyCode.Unicode(readUtf8CodePoint(buf))
             1 -> KeyCode.Backspace
             2 -> KeyCode.Tab
             3 -> KeyCode.Enter
@@ -263,6 +276,20 @@ object ProtocolCodec {
             21 -> KeyCode.Other(buf.int.toLong())
             else -> KeyCode.Space
         }
+    }
+
+    private fun readUtf8CodePoint(buf: ByteBuffer): Int {
+        val b0 = buf.get().toInt() and 0xFF
+        val extra = when {
+            b0 < 0x80 -> 0
+            b0 < 0xE0 -> 1
+            b0 < 0xF0 -> 2
+            else -> 3
+        }
+        val bytes = ByteArray(1 + extra)
+        bytes[0] = b0.toByte()
+        for (i in 1..extra) bytes[i] = buf.get()
+        return String(bytes, Charsets.UTF_8).codePointAt(0)
     }
 
     private fun readFully(stream: InputStream, b: ByteArray) {

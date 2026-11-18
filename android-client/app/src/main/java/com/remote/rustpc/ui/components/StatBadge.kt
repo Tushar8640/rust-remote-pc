@@ -1,14 +1,19 @@
 package com.remote.rustpc.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remote.rustpc.network.ConnectionStats
@@ -17,57 +22,49 @@ import com.remote.rustpc.ui.theme.*
 @Composable
 fun StatBadge(
     stats: ConnectionStats,
+    audioActive: Boolean,
+    audioMuted: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val rttColor = when {
-        stats.rttMs == 0L -> AccentCyan
-        stats.rttMs < 30 -> AccentGreen
-        stats.rttMs < 80 -> Color(0xFFFBBF24) // Yellow
-        else -> AccentRed
+    val (quality, qualityColor) = when {
+        stats.rttMs == 0L -> "Live" to AccentIndigoLight
+        stats.rttMs < 30 -> "Excellent" to AccentGreen
+        stats.rttMs < 80 -> "Good" to AccentAmber
+        else -> "Slow" to AccentRed
     }
 
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(20.dp))
-            .background(SurfaceDark.copy(alpha = 0.85f))
+            .background(BgDark.copy(alpha = 0.82f))
+            .border(1.dp, BorderDark, RoundedCornerShape(20.dp))
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Status Dot
         Box(
             modifier = Modifier
                 .size(8.dp)
-                .clip(RoundedCornerShape(4.dp))
-                .background(AccentGreen)
+                .clip(CircleShape)
+                .background(qualityColor)
         )
-
-        // FPS
+        Text(quality, style = Typography.labelMedium.copy(color = TextPrimary))
         Text(
-            text = "${stats.fps} FPS",
-            style = Typography.labelSmall.copy(fontSize = 12.sp, color = AccentCyan)
+            text = "${stats.rttMs} ms · ${stats.fps} fps",
+            style = Typography.labelSmall.copy(fontSize = 11.sp, color = TextSecondary)
         )
-
-        Text(
-            text = "•",
-            style = Typography.labelSmall.copy(color = TextSecondary)
-        )
-
-        // Latency RTT
-        Text(
-            text = if (stats.rttMs > 0) "${stats.rttMs} ms" else "< 1 ms",
-            style = Typography.labelSmall.copy(fontSize = 12.sp, color = rttColor)
-        )
-
         if (stats.screenWidth > 0 && stats.screenHeight > 0) {
             Text(
-                text = "•",
-                style = Typography.labelSmall.copy(color = TextSecondary)
+                text = "${stats.screenWidth}×${stats.screenHeight}",
+                style = Typography.labelSmall.copy(fontSize = 11.sp, color = TextFaint)
             )
-            // Resolution
-            Text(
-                text = "${stats.screenWidth}x${stats.screenHeight}",
-                style = Typography.labelSmall.copy(fontSize = 11.sp, color = TextSecondary)
+        }
+        if (audioActive) {
+            Icon(
+                imageVector = if (audioMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
+                contentDescription = if (audioMuted) "Audio muted" else "Audio on",
+                tint = if (audioMuted) TextFaint else AccentGreen,
+                modifier = Modifier.size(14.dp)
             )
         }
     }

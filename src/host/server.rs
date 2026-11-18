@@ -16,6 +16,8 @@ pub struct HostServerConfig {
     pub password: String,
     pub target_fps: u32,
     pub jpeg_quality: u8,
+    /// Stream this PC's audio output to connected clients.
+    pub audio_enabled: bool,
 }
 
 pub struct HostServer {
@@ -53,9 +55,10 @@ impl HostServer {
                             let password = self.config.password.clone();
                             let fps = self.config.target_fps;
                             let quality = self.config.jpeg_quality;
+                            let audio = self.config.audio_enabled;
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_client(socket, password, fps, quality).await {
+                                if let Err(e) = handle_client(socket, password, fps, quality, audio).await {
                                     error!("Client connection terminated: {:?}", e);
                                 }
                             });
@@ -98,6 +101,7 @@ async fn handle_client(
     expected_password: String,
     target_fps: u32,
     jpeg_quality: u8,
+    audio_enabled: bool,
 ) -> Result<()> {
     // 1. Initial Handshake & Authentication
     let first_packet = read_packet(&mut socket).await?;
@@ -230,6 +234,20 @@ async fn handle_client(
             }
         }
     });
+
+    // Audio: capture this PC's output and stream it. Held until the client
+    // disconnects; dropping it stops the capture thread.
+    let _audio_capture = if audio_enabled {
+        match crate::host::audio::AudioCapture::start(tx_outgoing.clone()) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!("Audio streaming unavailable: {:?}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Task 3: Input execution and incoming packet reader
     let mut input_executor = HostInputExecutor::new(screen_width, screen_height)?;

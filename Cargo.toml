@@ -40,11 +40,13 @@ thiserror = "1.0"
 arboard = "3.4"
 
 # Crypto / Auth
+getrandom = "0.2"
 sha2 = "0.10"
 hex = "0.4"
 
 # Optional H264 feature for openh264
 openh264 = { version = "0.6", optional = true }
+cpal = "0.18.2"
 
 [features]
 default = []

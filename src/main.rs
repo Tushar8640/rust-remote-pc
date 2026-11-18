@@ -36,6 +36,10 @@ enum Commands {
         /// JPEG compression quality (1-100)
         #[arg(short, long, default_value_t = 75)]
         quality: u8,
+
+        /// Do not stream this PC's audio to clients
+        #[arg(long)]
+        no_audio: bool,
     },
 
     /// Run as Client Viewer GUI connecting directly
@@ -74,6 +78,7 @@ fn main() -> Result<(), anyhow::Error> {
             password,
             fps,
             quality,
+            no_audio,
         }) => {
             info!("Starting Rust Remote Desktop - Headless Host Agent");
             let config = host::server::HostServerConfig {
@@ -81,6 +86,7 @@ fn main() -> Result<(), anyhow::Error> {
                 password,
                 target_fps: fps,
                 jpeg_quality: quality,
+                audio_enabled: !no_audio,
             };
 
             let server = host::server::HostServer::new(config);
@@ -106,8 +112,8 @@ fn launch_unified_gui(
 ) -> Result<(), anyhow::Error> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 640.0])
-            .with_min_inner_size([640.0, 480.0])
+            .with_inner_size([980.0, 680.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_title("Remote Desktop"),
         ..Default::default()
     };

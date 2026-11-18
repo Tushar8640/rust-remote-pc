@@ -1,5 +1,6 @@
 package com.remote.rustpc
 
+import android.content.pm.ActivityInfo
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -9,6 +10,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.remote.rustpc.data.ConnectionPreferences
 import com.remote.rustpc.network.ConnectionState
@@ -26,6 +30,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Draw behind the system bars; screens add their own insets.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         prefs = ConnectionPreferences(this)
         connection = RemoteConnection(lifecycleScope)
 
@@ -38,13 +45,36 @@ class MainActivity : ComponentActivity() {
                     val connectionState by connection.connectionState.collectAsState()
                     val bitmap by connection.latestBitmap.collectAsState()
                     val stats by connection.stats.collectAsState()
+                    val audioMuted by connection.audioMuted.collectAsState()
+                    val audioVolume by connection.audioVolume.collectAsState()
+                    val audioActive by connection.audioActive.collectAsState()
+
+                    var fullscreen by remember { mutableStateOf(true) }
+                    var landscapeLock by remember { mutableStateOf(false) }
+                    var recents by remember { mutableStateOf(prefs.getRecentHosts()) }
+                    var rememberPwState by remember { mutableStateOf(prefs.rememberPassword) }
+
+                    val connected = connectionState is ConnectionState.Connected
 
                     // Keep screen on while connected to PC
-                    LaunchedEffect(connectionState) {
-                        if (connectionState is ConnectionState.Connected) {
+                    LaunchedEffect(connected) {
+                        if (connected) {
                             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                         } else {
                             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
+                    }
+
+                    // Immersive full screen (hides status + navigation bars) while viewing the PC.
+                    LaunchedEffect(connected, fullscreen) {
+                        applyFullscreen(connected && fullscreen)
+                    }
+
+                    LaunchedEffect(connected, landscapeLock) {
+                        requestedOrientation = if (connected && landscapeLock) {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                         }
                     }
 
@@ -58,6 +88,13 @@ class MainActivity : ComponentActivity() {
                                 bitmap = bitmap,
                                 stats = stats,
                                 connection = connection,
+                                audioMuted = audioMuted,
+                                audioVolume = audioVolume,
+                                audioActive = audioActive,
+                                isFullscreen = fullscreen,
+                                onToggleFullscreen = { fullscreen = !fullscreen },
+                                isLandscapeLocked = landscapeLock,
+                                onToggleRotation = { landscapeLock = !landscapeLock },
                                 onDisconnect = {
                                     connection.disconnect()
                                 }
@@ -69,12 +106,20 @@ class MainActivity : ComponentActivity() {
                                 initialHost = prefs.lastHost,
                                 initialPort = prefs.lastPort,
                                 initialPassword = prefs.lastPassword,
-                                recentHosts = prefs.getRecentHosts(),
-                                onConnect = { host, port, pass ->
+                                initialRemember = rememberPwState,
+                                recentHosts = recents,
+                                onRemoveRecent = {
+                                    prefs.removeRecentHost(it)
+                                    recents = prefs.getRecentHosts()
+                                },
+                                onConnect = { host, port, pass, rememberPw ->
+                                    prefs.rememberPassword = rememberPw
+                                    rememberPwState = rememberPw
                                     prefs.lastHost = host
                                     prefs.lastPort = port
                                     prefs.lastPassword = pass
                                     prefs.addRecentHost(host)
+                                    recents = prefs.getRecentHosts()
                                     connection.connect(host, port, pass)
                                 }
                             )
@@ -82,6 +127,17 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun applyFullscreen(on: Boolean) {
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (on) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 

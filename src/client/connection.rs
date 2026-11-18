@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::client::audio::{AudioControl, AudioPlayer};
 use crate::common::crypto::hash_password;
 use crate::common::protocol::{InputEvent, Packet, PROTOCOL_VERSION};
 use anyhow::{anyhow, Result};
@@ -16,6 +17,8 @@ pub struct ConnectionHandle {
     pub screen_width: u32,
     pub screen_height: u32,
     pub rtt_ms: Arc<AtomicU64>,
+    /// Volume / mute controls. `None` if no audio output device is available.
+    pub audio: Option<Arc<AudioControl>>,
 }
 
 pub struct DecodedFrameMessage {
@@ -119,6 +122,15 @@ pub async fn connect_to_host(
         }
     });
 
+    // Audio playback (optional: the session still works without an output device)
+    let (mut audio_player, audio_ctl) = match AudioPlayer::new() {
+        Ok((p, c)) => (Some(p), Some(c)),
+        Err(e) => {
+            tracing::warn!("Audio playback unavailable: {:?}", e);
+            (None, None)
+        }
+    };
+
     // Incoming packet receiver
     tokio::spawn(async move {
         let mut decoder = crate::client::decoder::VideoDecoder::new();
@@ -153,6 +165,11 @@ pub async fn connect_to_host(
                             });
                         }
                     }
+                    Packet::Audio { sample_rate, channels, data } => {
+                        if let Some(p) = audio_player.as_mut() {
+                            p.push(sample_rate, channels, &data);
+                        }
+                    }
                     Packet::Pong(ts) => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -173,5 +190,6 @@ pub async fn connect_to_host(
         screen_width,
         screen_height,
         rtt_ms,
+        audio: audio_ctl,
     })
 }
