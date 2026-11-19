@@ -25,9 +25,9 @@ enum Commands {
         #[arg(short, long, default_value = "0.0.0.0:5885")]
         bind: String,
 
-        /// Pre-shared authentication password/token
-        #[arg(short, long, default_value = "secret123")]
-        password: String,
+        /// Password clients must present (default: the saved one, created on first use)
+        #[arg(short, long)]
+        password: Option<String>,
 
         /// Target streaming frame rate (FPS)
         #[arg(long, default_value_t = 30)]
@@ -61,13 +61,22 @@ enum Commands {
         #[arg(short = 'H', long)]
         host: String,
 
-        /// Host password
+        /// Host password (not needed when the host is an invite, which carries it)
         #[arg(short, long)]
-        password: String,
+        password: Option<String>,
 
         /// Quality mode to request: auto, smooth, sharp or saver
         #[arg(long)]
         quality_mode: Option<String>,
+
+        /// Diagnostic: after connecting, move the pointer to the middle of the host screen and
+        /// send this vertical wheel movement (120 = one notch, positive = up)
+        #[arg(long, allow_hyphen_values = true)]
+        scroll_y: Option<i32>,
+
+        /// Diagnostic: horizontal wheel movement (positive = right)
+        #[arg(long, allow_hyphen_values = true)]
+        scroll_x: Option<i32>,
     },
 
     /// Test that the premium relay is reachable and accepts this PC's licence
@@ -77,8 +86,18 @@ enum Commands {
         url: Option<String>,
     },
 
-    /// Print the join code to share so clients can connect through the premium relay
-    JoinCode,
+    /// Print the invite to send to whoever should connect to this PC
+    #[command(alias = "join-code")]
+    Invite {
+        /// Password to put in the invite (default: the saved one)
+        #[arg(short, long)]
+        password: Option<String>,
+
+        /// Include the premium relay (needs the premium URL and licence from the saved
+        /// settings or RRPC_PREMIUM_URL / RRPC_PREMIUM_LICENSE)
+        #[arg(long)]
+        premium: bool,
+    },
 
     /// Run as Client Viewer GUI connecting directly
     Client {
@@ -94,7 +113,9 @@ enum Commands {
 
 fn main() -> Result<(), anyhow::Error> {
     // Initialize logging
+    // Logs go to stderr so commands that print a result (for example `invite`) stay clean when piped.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -127,6 +148,17 @@ fn main() -> Result<(), anyhow::Error> {
                 settings.premium_enabled = true;
             }
             let premium_relay = settings.host_relay().map_err(|e| anyhow::anyhow!(e))?;
+            // Without --password, use the saved password (made once, kept), never a fixed default.
+            let password = match password {
+                Some(p) => p,
+                None => {
+                    if settings.ensure_host_password() {
+                        common::transport::save_settings(&settings);
+                    }
+                    settings.host_password.clone()
+                }
+            };
+            settings.host_password = password.clone();
             let p2p_key = if no_p2p {
                 None
             } else {
@@ -135,9 +167,10 @@ fn main() -> Result<(), anyhow::Error> {
                     "Pairing ID (connect from anywhere): {}",
                     common::transport::pairing_id(&key)
                 );
-                if let Some(code) = settings.join_code(&common::transport::pairing_id(&key)) {
-                    println!("Join code (share with premium clients, valid about a day): {code}");
-                }
+                println!(
+                    "Invite (send this to the device that will connect): {}",
+                    settings.invite(&common::transport::pairing_id(&key))
+                );
                 Some(key)
             };
             let config = host::server::HostServerConfig {
@@ -154,7 +187,7 @@ fn main() -> Result<(), anyhow::Error> {
             let server = host::server::HostServer::new(config);
             rt.block_on(server.run())?;
         }
-        Some(Commands::Check { host, password, quality_mode }) => {
+        Some(Commands::Check { host, password, quality_mode, scroll_y, scroll_x }) => {
             let opts = client::connection::ConnectOptions {
                 premium: None,
                 quality: parse_mode(quality_mode, common::protocol::QualityMode::Auto)?,
@@ -162,13 +195,27 @@ fn main() -> Result<(), anyhow::Error> {
             rt.block_on(async {
                 let started = std::time::Instant::now();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-                let handle = client::connection::connect_to_host(&host, &password, tx, opts).await?;
+                let handle = client::connection::connect_to_host(&host, password.as_deref().unwrap_or(""), tx, opts).await?;
                 println!(
                     "connected in {} ms, remote screen {}x{}",
                     started.elapsed().as_millis(),
                     handle.screen_width,
                     handle.screen_height
                 );
+                if scroll_y.is_some() || scroll_x.is_some() {
+                    let _ = handle.tx_input.send(common::protocol::InputEvent::MouseMove { x_ratio: 0.5, y_ratio: 0.5 }).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let _ = handle
+                        .tx_input
+                        .send(common::protocol::InputEvent::MouseScroll {
+                            delta_x: scroll_x.unwrap_or(0),
+                            delta_y: scroll_y.unwrap_or(0),
+                        })
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    println!("sent scroll x={:?} y={:?}", scroll_x, scroll_y);
+                    return Ok(());
+                }
                 // Measure for 10 s. Frame latency = now - host capture time; only
                 // meaningful when host and client share a clock (same machine).
                 let (mut n, mut lat_sum, mut lat_max) = (0u64, 0u64, 0u64);
@@ -218,23 +265,21 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             }
         }
-        Some(Commands::JoinCode) => {
+        Some(Commands::Invite { password, premium }) => {
             let mut settings = common::transport::load_settings();
-            settings.premium_enabled = true;
-            if !settings.premium_configured() {
-                anyhow::bail!(
-                    "Premium is not configured: set RRPC_PREMIUM_URL and RRPC_PREMIUM_LICENSE, or use the Premium page in the app."
-                );
+            if premium {
+                settings.premium_enabled = true;
+                if let Some(why) = settings.premium_blocker() {
+                    anyhow::bail!(why);
+                }
+            }
+            if let Some(p) = password {
+                settings.host_password = p;
+            } else if settings.ensure_host_password() {
+                common::transport::save_settings(&settings);
             }
             let key = common::transport::load_or_create_secret_key();
-            match settings.join_code(&common::transport::pairing_id(&key)) {
-                Some(code) => println!("{code}"),
-                None => anyhow::bail!(
-                    settings
-                        .premium_blocker()
-                        .unwrap_or_else(|| "Premium is not available.".to_string())
-                ),
-            }
+            println!("{}", settings.invite(&common::transport::pairing_id(&key)));
         }
         Some(Commands::Client { host, password }) => {
             info!("Starting Rust Remote Desktop - Client Mode");

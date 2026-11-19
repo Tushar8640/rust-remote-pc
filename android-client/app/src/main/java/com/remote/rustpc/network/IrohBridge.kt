@@ -25,13 +25,13 @@ object IrohBridge {
         return t.length == 64 && t.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
     }
 
-    /** True if [s] is a premium join code from a host. */
-    fun isJoinCode(s: String): Boolean = JoinCode.looksLikeJoinCode(s)
+    /** True if [s] is an invite copied from a host PC. */
+    fun isInvite(s: String): Boolean = Invite.looksLikeInvite(s)
 
-    /** Short form for display, e.g. `b6a1fada…7536fb2` or `Premium join code …AbCdEf`. */
+    /** Short form for display, e.g. `b6a1fada…7536fb2` or `Invite …AbCdEf`. */
     fun shorten(s: String): String = when {
         isPairingId(s) -> "${s.take(8)}…${s.takeLast(6)}"
-        isJoinCode(s) -> "Premium join code …${s.trim().takeLast(6)}"
+        isInvite(s) -> "Invite …${s.trim().takeLast(6)}"
         else -> s
     }
 

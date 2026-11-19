@@ -60,3 +60,6 @@ members = ["android-bridge", "premium-auth", "relay-server"]
 
 [profile.release]
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }

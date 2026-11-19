@@ -32,7 +32,19 @@ import androidx.compose.ui.unit.sp
 import com.remote.rustpc.data.DEFAULT_PORT
 import com.remote.rustpc.data.QualityMode
 import com.remote.rustpc.network.ConnectionState
+import com.remote.rustpc.network.Invite
 import com.remote.rustpc.network.IrohBridge
+import com.remote.rustpc.R
+import androidx.compose.foundation.Image
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.res.painterResource
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.delay
 import com.remote.rustpc.ui.theme.*
 
 @Composable
@@ -54,23 +66,52 @@ fun ConnectScreen(
     var showPassword by remember { mutableStateOf(false) }
     var rememberPw by remember { mutableStateOf(initialRemember) }
     var quality by remember { mutableStateOf(initialQuality) }
+    var showOptions by remember { mutableStateOf(false) }
 
     val focus = LocalFocusManager.current
-    val passwordFocus = remember { FocusRequester() }
 
     val isLoading = connectionState is ConnectionState.Connecting || connectionState is ConnectionState.Authenticating
     val serverError = (connectionState as? ConnectionState.Error)?.message
 
+    // What the field holds: an invite (everything included), a Pairing ID, or an address.
+    val invite = remember(host) { if (IrohBridge.isInvite(host)) Invite.decode(host) else null }
+    val inviteBroken = IrohBridge.isInvite(host) && invite == null
     val isPairingId = IrohBridge.isPairingId(host)
-    val isJoinCode = IrohBridge.isJoinCode(host)
+    val isAddress = host.isNotBlank() && invite == null && !inviteBroken && !isPairingId
     val port = portText.toIntOrNull()
-    val portValid = isPairingId || isJoinCode || (port != null && port in 1..65535)
-    val canConnect = !isLoading && host.isNotBlank() && portValid
+    val portValid = !isAddress || (port != null && port in 1..65535)
+    // The password is only asked for when the invite does not already carry it.
+    val needsPassword = host.isNotBlank() && !inviteBroken && !(invite != null && invite.password.isNotEmpty())
+    val canConnect = !isLoading && host.isNotBlank() && !inviteBroken && portValid
+
+    // An invite on the clipboard is offered as a one-tap connect.
+    val clipboard = LocalClipboardManager.current
+    var clipInvite by remember { mutableStateOf<String?>(null) }
+    var resumeTick by remember { mutableIntStateOf(0) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) resumeTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(resumeTick) {
+        // Android only lets the focused app read the clipboard, so wait for focus.
+        delay(350)
+        val text = clipboard.getText()?.text?.trim()
+        clipInvite = text?.takeIf { IrohBridge.isInvite(it) && Invite.decode(it) != null }
+    }
 
     fun submit() {
         if (!canConnect) return
         focus.clearFocus()
         onConnect(host.trim(), port ?: DEFAULT_PORT, password, rememberPw, quality)
+    }
+
+    fun pasteFromClipboard() {
+        val text = clipboard.getText()?.text?.trim()
+        if (!text.isNullOrBlank()) host = text
     }
 
     Box(
@@ -96,16 +137,17 @@ fun ConnectScreen(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(AccentIndigo),
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(13.dp))
+                        .background(
+                            Brush.linearGradient(listOf(Color(0xFF818CF8), Color(0xFF4F46E5), Color(0xFF3730A3)))
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.DesktopWindows,
+                    Image(
+                        painter = painterResource(R.drawable.ic_launcher_foreground),
                         contentDescription = null,
-                        tint = TextPrimary,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.requiredSize(84.dp)
                     )
                 }
                 Column {
@@ -124,9 +166,57 @@ fun ConnectScreen(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Enter the join code, Pairing ID or address, and the password shown on the host.",
+                    "Paste the invite you received from the PC you want to control.",
                     style = Typography.bodyMedium.copy(color = TextSecondary)
                 )
+            }
+
+            // ── Invite on the clipboard ──
+            if (host.isBlank() && clipInvite != null && !isLoading) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = AccentGreen.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(Icons.Default.ContentPaste, contentDescription = null, tint = AccentGreen)
+                            Column {
+                                Text(
+                                    "Invite found on your clipboard",
+                                    style = Typography.bodyMedium.copy(color = TextPrimary, fontWeight = FontWeight.SemiBold)
+                                )
+                                Text(
+                                    IrohBridge.shorten(clipInvite ?: ""),
+                                    style = Typography.labelMedium.copy(color = TextSecondary, fontFamily = FontFamily.Monospace)
+                                )
+                            }
+                        }
+                        Button(
+                            onClick = {
+                                val clip = clipInvite ?: return@Button
+                                host = clip
+                                focus.clearFocus()
+                                onConnect(clip, DEFAULT_PORT, "", rememberPw, quality)
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = BgDark),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                        ) {
+                            Text("Connect with it", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                        }
+                    }
+                }
             }
 
             // ── Form card ──
@@ -141,94 +231,105 @@ fun ConnectScreen(
                         .padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        AppTextField(
-                            value = host,
-                            onValueChange = { host = it.trim() },
-                            label = "Join code, Pairing ID or address",
-                            placeholder = "Paste the join code",
-                            leading = Icons.Default.Lan,
-                            keyboardType = KeyboardType.Uri,
-                            imeAction = ImeAction.Next,
-                            enabled = !isLoading,
-                            mono = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        // Port only matters for LAN/Tailscale addresses.
-                        if (host.isNotBlank() && !isPairingId && !isJoinCode) {
+                    if (invite != null) {
+                        // A pasted invite is shown as one tidy line instead of a wall of text.
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = AccentGreen)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Invite ready",
+                                    style = Typography.bodyMedium.copy(color = TextPrimary, fontWeight = FontWeight.SemiBold)
+                                )
+                                Text(
+                                    "…" + host.trim().takeLast(6) + if (invite.hasRelay) "  ·  Premium" else "",
+                                    style = Typography.labelMedium.copy(color = TextSecondary, fontFamily = FontFamily.Monospace)
+                                )
+                            }
+                            TextButton(onClick = { host = "" }, enabled = !isLoading) {
+                                Text("Change", color = AccentIndigoLight)
+                            }
+                        }
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             AppTextField(
-                                value = portText,
-                                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                                label = "Port",
-                                placeholder = "$DEFAULT_PORT",
-                                keyboardType = KeyboardType.Number,
+                                value = host,
+                                onValueChange = { host = it.trim() },
+                                label = "Invite, Pairing ID or address",
+                                placeholder = "Paste the invite here",
+                                leading = Icons.Default.Link,
+                                keyboardType = KeyboardType.Uri,
                                 imeAction = ImeAction.Next,
                                 enabled = !isLoading,
                                 mono = true,
-                                isError = portText.isNotEmpty() && !portValid,
-                                modifier = Modifier.width(104.dp)
+                                isError = inviteBroken,
+                                modifier = Modifier.weight(1f)
                             )
-                        }
-                    }
-                    if (isPairingId || isJoinCode) {
-                        Text(
-                            if (isJoinCode) "Premium join code detected: connects through the host's premium relay."
-                            else "Pairing ID detected: connects over the internet, no VPN needed.",
-                            style = Typography.labelMedium.copy(color = TextFaint)
-                        )
-                    }
-                    AppTextField(
-                        value = password,
-                        onValueChange = { password = it },
-                        label = "Password",
-                        placeholder = "Host password",
-                        leading = Icons.Default.Lock,
-                        trailing = {
-                            IconButton(onClick = { showPassword = !showPassword }) {
-                                Icon(
-                                    imageVector = if (showPassword) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                    contentDescription = if (showPassword) "Hide password" else "Show password",
-                                    tint = TextSecondary
+                            // Port only matters for LAN/Tailscale addresses.
+                            if (isAddress) {
+                                AppTextField(
+                                    value = portText,
+                                    onValueChange = { portText = it.filter(Char::isDigit).take(5) },
+                                    label = "Port",
+                                    placeholder = "$DEFAULT_PORT",
+                                    keyboardType = KeyboardType.Number,
+                                    imeAction = ImeAction.Next,
+                                    enabled = !isLoading,
+                                    mono = true,
+                                    isError = portText.isNotEmpty() && !portValid,
+                                    modifier = Modifier.width(104.dp)
                                 )
                             }
-                        },
-                        visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardType = KeyboardType.Password,
-                        imeAction = ImeAction.Go,
-                        keyboardActions = KeyboardActions(onGo = { submit() }),
-                        enabled = !isLoading,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(passwordFocus)
-                    )
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { rememberPw = !rememberPw }
-                            .padding(vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = rememberPw,
-                            onCheckedChange = { rememberPw = it },
-                            colors = CheckboxDefaults.colors(
-                                checkedColor = AccentIndigo,
-                                uncheckedColor = TextFaint,
-                                checkmarkColor = TextPrimary
-                            )
-                        )
-                        Column {
-                            Text("Remember password", style = Typography.bodyMedium.copy(color = TextPrimary))
+                        }
+                        if (inviteBroken) {
                             Text(
-                                "Stored unencrypted on this phone",
-                                style = Typography.labelMedium.copy(color = TextFaint)
+                                "That invite is not valid. Copy it again from the PC.",
+                                style = Typography.labelMedium.copy(color = AccentRed)
                             )
+                        }
+                        if (host.isBlank()) {
+                            OutlinedButton(
+                                onClick = { pasteFromClipboard() },
+                                enabled = !isLoading,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, AccentIndigo),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                            ) {
+                                Icon(Icons.Default.ContentPaste, contentDescription = null, tint = AccentIndigoLight)
+                                Spacer(Modifier.width(10.dp))
+                                Text("Paste invite", color = AccentIndigoLight, fontWeight = FontWeight.SemiBold)
+                            }
                         }
                     }
 
-                    QualitySelector(selected = quality, enabled = !isLoading) { quality = it }
+                    if (needsPassword) {
+                        AppTextField(
+                            value = password,
+                            onValueChange = { password = it },
+                            label = "Password",
+                            placeholder = "Host password",
+                            leading = Icons.Default.Lock,
+                            trailing = {
+                                IconButton(onClick = { showPassword = !showPassword }) {
+                                    Icon(
+                                        imageVector = if (showPassword) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                        contentDescription = if (showPassword) "Hide password" else "Show password",
+                                        tint = TextSecondary
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Go,
+                            keyboardActions = KeyboardActions(onGo = { submit() }),
+                            enabled = !isLoading,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
 
                     if (serverError != null) {
                         Row(
@@ -284,6 +385,57 @@ fun ConnectScreen(
                             Text("Connect", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                         }
                     }
+
+                    // ── Options, out of the way ──
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { showOptions = !showOptions }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Options",
+                            style = Typography.labelMedium.copy(color = TextSecondary),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(
+                            if (showOptions) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = null,
+                            tint = TextSecondary
+                        )
+                    }
+                    if (showOptions) {
+                        QualitySelector(selected = quality, enabled = !isLoading) { quality = it }
+                        if (needsPassword) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { rememberPw = !rememberPw }
+                                    .padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = rememberPw,
+                                    onCheckedChange = { rememberPw = it },
+                                    colors = CheckboxDefaults.colors(
+                                        checkedColor = AccentIndigo,
+                                        uncheckedColor = TextFaint,
+                                        checkmarkColor = TextPrimary
+                                    )
+                                )
+                                Column {
+                                    Text("Remember password", style = Typography.bodyMedium.copy(color = TextPrimary))
+                                    Text(
+                                        "Stored unencrypted on this phone",
+                                        style = Typography.labelMedium.copy(color = TextFaint)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -301,10 +453,7 @@ fun ConnectScreen(
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(SurfaceDark)
                                 .border(1.dp, BorderDark, RoundedCornerShape(12.dp))
-                                .clickable(enabled = !isLoading) {
-                                    host = rHost
-                                    if (password.isEmpty()) passwordFocus.requestFocus()
-                                }
+                                .clickable(enabled = !isLoading) { host = rHost }
                                 .padding(start = 14.dp, top = 4.dp, bottom = 4.dp, end = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -353,7 +502,7 @@ fun ConnectScreen(
                     modifier = Modifier.size(18.dp)
                 )
                 Text(
-                    text = "Start sharing on the PC first, then paste the join code (premium) or Pairing ID it shows. This works from any network. A LAN or Tailscale address (100.x.y.z) also works.",
+                    text = "On the PC, open the app, press Start sharing and Copy invite. Send it to this phone, then paste it here. It works from any network.",
                     style = Typography.bodyMedium.copy(color = TextSecondary, fontSize = 12.5.sp)
                 )
             }

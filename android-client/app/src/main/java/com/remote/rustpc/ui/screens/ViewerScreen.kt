@@ -20,6 +20,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.remote.rustpc.data.KeyCode
@@ -27,7 +29,7 @@ import com.remote.rustpc.network.ConnectionStats
 import com.remote.rustpc.network.RemoteConnection
 import com.remote.rustpc.ui.components.QuickToolbar
 import com.remote.rustpc.ui.components.RemoteCanvas
-import com.remote.rustpc.ui.components.StatBadge
+import com.remote.rustpc.ui.components.HudOverlay
 import com.remote.rustpc.ui.theme.*
 
 @Composable
@@ -43,12 +45,18 @@ fun ViewerScreen(
     isLandscapeLocked: Boolean,
     onToggleRotation: () -> Unit,
     onDisconnect: () -> Unit,
+    hudOpacity: Float = 0.9f,
+    hudOffset: Offset = Offset.Zero,
+    onHudChange: (opacity: Float, offset: Offset) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     var isDirectTouch by remember { mutableStateOf(true) }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var toolbarVisible by remember { mutableStateOf(true) }
+    var boxSize by remember { mutableStateOf(IntSize.Zero) }
+    var hudAlpha by remember { mutableFloatStateOf(hudOpacity) }
+    var hudPos by remember { mutableStateOf(hudOffset) }
 
     var showKeyboardDialog by remember { mutableStateOf(false) }
     var inputText by remember { mutableStateOf("") }
@@ -58,6 +66,7 @@ fun ViewerScreen(
         modifier = modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color.Black)
+            .onSizeChanged { boxSize = it }
     ) {
         // Full-screen remote canvas
         RemoteCanvas(
@@ -92,11 +101,19 @@ fun ViewerScreen(
             }
         }
 
-        // Top status HUD
-        StatBadge(
+        // Ping/fps badge: drag it anywhere, gear = opacity. Both are remembered.
+        HudOverlay(
             stats = stats,
             audioActive = audioActive,
             audioMuted = audioMuted,
+            opacity = hudAlpha,
+            offset = hudPos,
+            containerSize = boxSize,
+            onChange = { alpha, pos, final ->
+                hudAlpha = alpha
+                hudPos = pos
+                if (final) onHudChange(alpha, pos)
+            },
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()

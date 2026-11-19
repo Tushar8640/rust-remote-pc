@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -30,6 +31,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var prefs: ConnectionPreferences
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Must come before super.onCreate: swaps the splash theme for the app theme.
+        installSplashScreen()
         super.onCreate(savedInstanceState)
 
         // Draw behind the system bars; screens add their own insets.
@@ -99,6 +102,13 @@ class MainActivity : ComponentActivity() {
                                 onToggleRotation = { landscapeLock = !landscapeLock },
                                 onDisconnect = {
                                     connection.disconnect()
+                                },
+                                hudOpacity = prefs.hudOpacity,
+                                hudOffset = androidx.compose.ui.geometry.Offset(prefs.hudOffsetX, prefs.hudOffsetY),
+                                onHudChange = { alpha, pos ->
+                                    prefs.hudOpacity = alpha
+                                    prefs.hudOffsetX = pos.x
+                                    prefs.hudOffsetY = pos.y
                                 }
                             )
                         }
@@ -118,12 +128,12 @@ class MainActivity : ComponentActivity() {
                                 onConnect = { host, port, pass, rememberPw, quality ->
                                     prefs.rememberPassword = rememberPw
                                     rememberPwState = rememberPw
-                                    if (!IrohBridge.isJoinCode(host)) prefs.lastHost = host
+                                    if (!IrohBridge.isInvite(host)) prefs.lastHost = host
                                     prefs.lastPort = port
                                     prefs.lastPassword = pass
                                     prefs.qualityModeId = quality.id
                                     // Join codes expire within a day, so do not keep them in the recent list.
-                                    if (!IrohBridge.isJoinCode(host)) prefs.addRecentHost(host)
+                                    if (!IrohBridge.isInvite(host)) prefs.addRecentHost(host)
                                     recents = prefs.getRecentHosts()
                                     connection.connect(
                                         host, port, pass,

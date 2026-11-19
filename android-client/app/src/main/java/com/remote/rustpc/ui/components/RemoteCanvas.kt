@@ -2,6 +2,7 @@ package com.remote.rustpc.ui.components
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
@@ -16,29 +17,34 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import com.remote.rustpc.data.MouseBtn
-import com.remote.rustpc.network.RemoteConnection
+import com.remote.rustpc.network.RemoteInput
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 private const val LONG_PRESS_MS = 550L
 private const val DOUBLE_TAP_MS = 350L
-private const val DOUBLE_TAP_SLOP_PX = 60f
-private const val SCROLL_STEP_PX = 28f
+private const val WHEEL_NOTCH = 120f        // one mouse-wheel notch, as the PC expects it
+private const val MIN_WHEEL_UNITS = 12f     // smallest scroll packet, keeps traffic modest
+private const val MODE_UNDECIDED = 0
+private const val MODE_SCROLL = 1
+private const val MODE_ZOOM = 2
 
 /**
  * Remote screen with touch input.
  *
- * Direct touch:  tap = click, double tap = double click, long press = right click,
- *                drag = left-button drag, two fingers = pinch zoom / pan.
- * Trackpad:      drag moves the cursor, tap = click, long press = right click,
- *                two fingers = scroll (or zoom when pinching).
+ * Both modes:
+ *   one tap = one click, two quick taps = double click, long press = right click,
+ *   two-finger drag = scroll (vertical and horizontal), two-finger pinch = zoom.
+ * Direct touch: dragging one finger drags with the left button held.
+ * Trackpad:     dragging one finger moves the cursor.
  */
 @Composable
 fun RemoteCanvas(
     bitmap: Bitmap?,
-    connection: RemoteConnection,
+    connection: RemoteInput,
     isDirectTouch: Boolean,
     scale: Float,
     offset: Offset,
@@ -63,6 +69,13 @@ fun RemoteCanvas(
             .fillMaxSize()
             .pointerInput(Unit) {
                 val slop = viewConfiguration.touchSlop * 1.5f
+                // Two taps closer than this count as a double click (about 5 mm on screen).
+                val doubleTapSlop = 32.dp.toPx()
+                // A two-finger gesture is a pinch only if the fingers spread or close by this much.
+                val pinchSlop = 10.dp.toPx()
+                // Finger travel that equals one mouse-wheel notch. About 1:1 with the page
+                // when the remote screen is shown fit-to-screen.
+                val wheelUnitsPerPx = WHEEL_NOTCH / 22.dp.toPx()
 
                 awaitPointerEventScope {
                     var downTime = 0L
@@ -71,12 +84,32 @@ fun RemoteCanvas(
                     var multi = false        // a multi-finger gesture is in progress
                     var lastTapTime = 0L
                     var lastTapPos = Offset.Zero
-                    var scrollAccum = 0f
+                    var lastTapRatio: Pair<Float, Float>? = null
+
+                    // Two-finger gesture state
+                    var mode = MODE_UNDECIDED
+                    var startSize = 0f
+                    var movedPan = Offset.Zero
+                    var wheelX = 0f
+                    var wheelY = 0f
 
                     fun ratioOf(p: Offset) =
                         calculateScreenRatio(p, canvasSize, bitmapState, scaleState, offsetState)
 
                     fun inside(r: Pair<Float, Float>) = r.first in 0f..1f && r.second in 0f..1f
+
+                    /** Turns finger movement into mouse-wheel movement (natural scrolling). */
+                    fun scrollBy(panPx: Offset) {
+                        wheelY += panPx.y * wheelUnitsPerPx      // fingers down = page up
+                        wheelX -= panPx.x * wheelUnitsPerPx      // fingers left = page right
+                        val dy = if (abs(wheelY) >= MIN_WHEEL_UNITS) wheelY.toInt() else 0
+                        val dx = if (abs(wheelX) >= MIN_WHEEL_UNITS) wheelX.toInt() else 0
+                        if (dx != 0 || dy != 0) {
+                            connection.sendMouseScroll(dx, dy)
+                            wheelY -= dy
+                            wheelX -= dx
+                        }
+                    }
 
                     while (true) {
                         val event = awaitPointerEvent()
@@ -84,7 +117,7 @@ fun RemoteCanvas(
                         if (changes.isEmpty()) continue
                         val pressedCount = changes.count { it.pressed }
 
-                        // ── Two or more fingers: zoom / pan / scroll ──
+                        // ── Two or more fingers: scroll, or pinch to zoom ──
                         if (pressedCount >= 2) {
                             if (!multi) {
                                 multi = true
@@ -92,20 +125,41 @@ fun RemoteCanvas(
                                     connection.sendMouseUp(MouseBtn.LEFT)
                                     dragging = false
                                 }
-                                scrollAccum = 0f
+                                mode = MODE_UNDECIDED
+                                // The size is only meaningful once both fingers have been seen moving
+                                // (the event that adds the second finger reports just one), so it is
+                                // captured on the next event.
+                                startSize = -1f
+                                movedPan = Offset.Zero
+                                wheelX = 0f
+                                wheelY = 0f
+                                lastTapTime = 0L // fingers on screen cancel a pending double click
                             }
                             val zoom = event.calculateZoom()
                             val pan = event.calculatePan()
-                            val pinching = abs(zoom - 1f) > 0.015f
 
-                            if (!directState && scaleState <= 1.01f && !pinching) {
-                                // Trackpad: two-finger drag scrolls the remote page.
-                                scrollAccum += pan.y
-                                while (abs(scrollAccum) >= SCROLL_STEP_PX) {
-                                    val dir = if (scrollAccum > 0) 1 else -1
-                                    connection.sendMouseScroll(0, 120 * dir)
-                                    scrollAccum -= SCROLL_STEP_PX * dir
+                            // Decide once, so a scroll never turns into a zoom half way through.
+                            if (mode == MODE_UNDECIDED) {
+                                movedPan += pan
+                                val size = event.calculateCentroidSize()
+                                if (startSize < 0f) {
+                                    if (size > 0f) startSize = size
+                                } else if (abs(size - startSize) > pinchSlop) {
+                                    mode = MODE_ZOOM
+                                } else if (hypot(movedPan.x.toDouble(), movedPan.y.toDouble()) > slop) {
+                                    mode = MODE_SCROLL
+                                    if (directState) {
+                                        // The wheel acts on the window under the fingers.
+                                        val centre = changes.filter { it.pressed }
+                                            .map { it.position }
+                                            .reduce { a, b -> a + b } / pressedCount.toFloat()
+                                        val r = ratioOf(centre)
+                                        if (inside(r)) connection.sendMouseMove(r.first, r.second)
+                                    }
+                                    scrollBy(movedPan) // catch up on the movement spent deciding
                                 }
+                            } else if (mode == MODE_SCROLL) {
+                                scrollBy(pan)
                             } else if (zoom != 1f || pan != Offset.Zero) {
                                 transformState(zoom, pan)
                             }
@@ -176,28 +230,35 @@ fun RemoteCanvas(
                                 connection.sendMouseUp(MouseBtn.LEFT)
                             } else if (!moved) {
                                 // A tap (no meaningful movement)
-                                val canClick = if (directState) {
-                                    val r = ratioOf(downPos)
-                                    if (inside(r)) connection.sendMouseMove(r.first, r.second)
-                                    inside(r)
-                                } else true
+                                val tapRatio = if (directState) ratioOf(downPos) else null
+                                val canClick = tapRatio?.let { inside(it) } ?: true
 
                                 if (canClick) {
                                     if (elapsed >= LONG_PRESS_MS) {
+                                        tapRatio?.let { connection.sendMouseMove(it.first, it.second) }
                                         connection.sendMouseClick(MouseBtn.RIGHT)
                                         lastTapTime = 0L
                                     } else {
-                                        // Each tap is a plain click. Two quick taps in the same
-                                        // place reach the host as two clicks, which Windows treats
-                                        // as a double-click.
-                                        connection.sendMouseClick(MouseBtn.LEFT)
+                                        // One tap is one click. A second tap soon after, in about
+                                        // the same place, is a second click: Windows turns that
+                                        // pair into a double click. The second click is sent at
+                                        // exactly the first click's position, because Windows
+                                        // only pairs clicks that land within a few pixels.
                                         val isSecond = now - lastTapTime < DOUBLE_TAP_MS &&
                                             hypot(
                                                 (downPos.x - lastTapPos.x).toDouble(),
                                                 (downPos.y - lastTapPos.y).toDouble()
-                                            ) < DOUBLE_TAP_SLOP_PX
-                                        lastTapTime = if (isSecond) 0L else now
-                                        lastTapPos = downPos
+                                            ) < doubleTapSlop
+                                        val at = if (isSecond && lastTapRatio != null) lastTapRatio else tapRatio
+                                        at?.let { connection.sendMouseMove(it.first, it.second) }
+                                        connection.sendMouseClick(MouseBtn.LEFT)
+                                        if (isSecond) {
+                                            lastTapTime = 0L
+                                        } else {
+                                            lastTapTime = now
+                                            lastTapPos = downPos
+                                            lastTapRatio = tapRatio
+                                        }
                                     }
                                 }
                             }

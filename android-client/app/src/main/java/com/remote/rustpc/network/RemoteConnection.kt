@@ -36,7 +36,7 @@ data class ConnectionStats(
     val frameCount: Long = 0L
 )
 
-class RemoteConnection(private val coroutineScope: CoroutineScope) {
+class RemoteConnection(private val coroutineScope: CoroutineScope) : RemoteInput {
 
     private val tag = "RemoteConnection"
 
@@ -108,13 +108,15 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                 var connectHost = host
                 var connectPort = port
                 var preamble: ByteArray? = null
-                val join = if (IrohBridge.isJoinCode(host)) {
-                    JoinCode.decode(host) ?: error("That join code is not valid. Copy it again from the PC.")
+                val invite = if (IrohBridge.isInvite(host)) {
+                    Invite.decode(host) ?: error("That invite is not valid. Copy it again from the PC.")
                 } else null
-                if (join != null || IrohBridge.isPairingId(host)) {
+                // An invite carries the host password; otherwise use what was typed.
+                val effectivePassword = invite?.password?.takeIf { it.isNotEmpty() } ?: password
+                if (invite != null || IrohBridge.isPairingId(host)) {
                     Log.d(tag, "Connecting to ${IrohBridge.shorten(host)} over P2P...")
-                    val ep = if (join != null) {
-                        IrohBridge.connect(join.pairingId, join.relayUrl, join.pass)
+                    val ep = if (invite != null) {
+                        IrohBridge.connect(invite.pairingId, invite.relayUrl, invite.pass)
                     } else {
                         IrohBridge.connect(host)
                     }
@@ -142,7 +144,7 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                 _connectionState.value = ConnectionState.Authenticating
                 val authPacket = Packet.AuthRequest(
                     clientVersion = PROTOCOL_VERSION,
-                    tokenHash = ProtocolCodec.hashPassword(password)
+                    tokenHash = ProtocolCodec.hashPassword(effectivePassword)
                 )
                 out.write(ProtocolCodec.encodePacket(authPacket))
                 out.flush()
@@ -298,19 +300,19 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
         sendPacket(Packet.SetQuality(mode.id))
     }
 
-    fun sendMouseMove(xRatio: Float, yRatio: Float) {
+    override fun sendMouseMove(xRatio: Float, yRatio: Float) {
         sendPacket(Packet.Input(InputEvent.MouseMove(xRatio.coerceIn(0f, 1f), yRatio.coerceIn(0f, 1f))))
     }
 
-    fun sendMouseDown(button: MouseBtn) {
+    override fun sendMouseDown(button: MouseBtn) {
         sendPacket(Packet.Input(InputEvent.MouseDown(button)))
     }
 
-    fun sendMouseUp(button: MouseBtn) {
+    override fun sendMouseUp(button: MouseBtn) {
         sendPacket(Packet.Input(InputEvent.MouseUp(button)))
     }
 
-    fun sendMouseClick(button: MouseBtn) {
+    override fun sendMouseClick(button: MouseBtn) {
         sendMouseDown(button)
         sendMouseUp(button)
     }
@@ -320,7 +322,7 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
         sendMouseClick(button)
     }
 
-    fun sendMouseScroll(deltaX: Int, deltaY: Int) {
+    override fun sendMouseScroll(deltaX: Int, deltaY: Int) {
         sendPacket(Packet.Input(InputEvent.MouseScroll(deltaX, deltaY)))
     }
 

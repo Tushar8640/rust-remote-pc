@@ -4,13 +4,13 @@ How premium works for your customers:
 
 1. The **host** (the PC being controlled) turns on **Premium** in the app. The app then
    sends its connection through your relay server automatically.
-2. The host copies a **join code** and sends it, with the password, to the person who
+2. The host copies an **invite** and sends it to the person who
    should connect.
-3. The **client** (desktop app or Android app) pastes the join code and connects. The client
+3. The **client** (desktop app or Android app) pastes the invite and connects. The client
    needs no licence, URL or settings.
 
-Only hosts holding a licence you issued can use the relay. A join code carries a
-short-lived pass (about a day), so a leaked code stops working on its own.
+Only hosts holding a licence you issued can use the relay. An invite carries a
+short-lived pass (about a week), so a leaked code stops working on its own.
 
 ## Before you deploy: things to know
 
@@ -97,28 +97,28 @@ To spare customers typing the URL, build with it set:
    Expect "Connected to the premium relay". Without a valid code, Premium cannot be switched on
    and the app offers **Subscribe**.
 2. On **Share this PC**, set **Connection** to **Premium**, then **Start sharing**.
-3. Press **Copy join code** and send it, plus the password, to the person who will connect.
+3. Press **Copy invite** and send it to the person who will connect. The invite already contains the password.
 
-**On the connecting device (desktop or Android):** paste the join code where the Pairing ID
+**On the connecting device (desktop or Android):** paste the invite where the Pairing ID
 goes, enter the password, connect. Nothing else to set up.
 
 Headless hosts: set `RRPC_PREMIUM=1`, `RRPC_PREMIUM_URL` and `RRPC_PREMIUM_LICENSE` (the coupon or licence key), then
-run `rust-remote-pc host --password <pw>`. The join code is printed at start-up;
+run `rust-remote-pc host --password <pw>`. The invite is printed at start-up;
 `rust-remote-pc join-code` prints a fresh one.
 
 ## Operations
 
 | Task | How |
 |---|---|
-| Revoke a customer or coupon | Add its id to the `REVOKED_LICENSES` environment variable (comma-separated) in Render and let it redeploy. Their host can no longer register, and join codes built from that licence stop being accepted at the next connection. |
+| Revoke a customer or coupon | Add its id to the `REVOKED_LICENSES` environment variable (comma-separated) in Render and let it redeploy. Their host can no longer register, and invites built from that licence stop being accepted at the next connection. |
 | Cap bandwidth per client | Set `CLIENT_MAX_KBPS` (kbit/s), for example `30000`. |
 | Rotate everything | Change `RELAY_SECRET`. This invalidates every coupon and licence, so reissue them all. |
 | Check a pass | `premium-relay.exe check <pass>` (needs `RELAY_SECRET`). |
 
 Notes:
 
-- A host's own pass lasts 30 days and is minted each time sharing starts. Join codes last
-  about a day. Restart sharing if a host has been running for more than 30 days.
+- A host's own pass lasts 30 days and is minted each time sharing starts. invites last
+  about a week. Restart sharing if a host has been running for more than 30 days.
 - Passes carry an absolute expiry, so a PC with a badly wrong clock will have its pass
   rejected. If **Test connection** fails but the URL is right, check the PC's date and time.
 - The activation code is stored in plain text on the host PC (`%APPDATA%\rust-remote-pc\settings.txt`).
@@ -131,8 +131,8 @@ Notes:
 Tested: the Docker image built from this Dockerfile and run the way Render runs it
 (`PORT`, `RELAY_SECRET`); licences issued inside the container match the local tool;
 health check path `/` returns 200; a premium host registers; a desktop client and the
-Android app (in an emulator) connect with only a join code; a forged pass, a revoked
-licence and a malformed join code are refused; unit tests for the licence, pass and
+Android app (in an emulator) connect with only An invite; a forged pass, a revoked
+licence and a malformed invite are refused; unit tests for the licence, pass and
 join-code logic.
 
 Not tested: a real Render deployment, connections through Render's HTTPS proxy (the local

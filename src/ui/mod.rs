@@ -52,8 +52,10 @@ pub struct UnifiedRemoteApp {
 
     // Host
     host_port: String,
-    host_password: String,
     show_host_pw: bool,
+    /// Also accept direct (IP address) connections on the local network. Off by default:
+    /// invites work everywhere and avoid opening a port.
+    host_direct: bool,
     host_fps: u32,
     host_quality: u8,
     host_audio: bool,
@@ -72,6 +74,8 @@ pub struct UnifiedRemoteApp {
     premium_gate: bool,
     relay_test: Option<oneshot::Receiver<Result<String, String>>>,
     relay_test_result: Option<(bool, String)>,
+    /// The running premium check was started by "Activate", so success turns Premium on.
+    activate_after_test: bool,
 
     // Client
     client_addr: String,
@@ -84,6 +88,9 @@ pub struct UnifiedRemoteApp {
     recents: Vec<String>,
     focus_addr: bool,
     client_mode: QualityMode,
+    /// An invite found on the clipboard when the Connect page opened.
+    clipboard_invite: Option<String>,
+    check_clipboard: bool,
 
     // Session
     conn: Option<ConnectionHandle>,
@@ -114,7 +121,13 @@ impl UnifiedRemoteApp {
 
         let ips = get_local_ips();
         let p2p_key = transport::load_or_create_secret_key();
-        let settings = transport::load_settings();
+        let mut settings = transport::load_settings();
+        if let Some(p) = initial_password.clone() {
+            settings.host_password = p;
+        }
+        if settings.ensure_host_password() {
+            transport::save_settings(&settings);
+        }
         let recents = load_recents();
         let default_addr = if let Some(h) = initial_host {
             h
@@ -130,8 +143,8 @@ impl UnifiedRemoteApp {
             tab: Tab::Host,
             host_port: DEFAULT_PORT.to_string(),
             // A fresh random password per launch unless one was supplied.
-            host_password: initial_password.clone().unwrap_or_else(|| random_password(12)),
             show_host_pw: false,
+            host_direct: false,
             host_fps: 60,
             host_quality: 75,
             host_audio: true,
@@ -143,11 +156,14 @@ impl UnifiedRemoteApp {
             p2p_key,
             host_mode: settings.host_quality,
             client_mode: settings.client_quality,
+            clipboard_invite: None,
+            check_clipboard: true,
             settings,
             show_relay_key: false,
             premium_gate: false,
             relay_test: None,
             relay_test_result: None,
+            activate_after_test: false,
 
             client_addr: default_addr,
             client_password: initial_password.unwrap_or_default(),
@@ -214,10 +230,6 @@ impl UnifiedRemoteApp {
             .unwrap_or_else(|| "127.0.0.1".to_string())
     }
 
-    fn has_tailscale(&self) -> bool {
-        self.ips.iter().any(|i| i.is_tailscale)
-    }
-
     fn host_port_num(&self) -> Option<u16> {
         self.host_port.trim().parse::<u16>().ok().filter(|p| *p > 0)
     }
@@ -230,9 +242,12 @@ impl UnifiedRemoteApp {
             self.toast("Enter a valid port (1-65535)");
             return;
         };
-        if self.host_password.is_empty() {
-            self.toast("Set a password first");
-            return;
+        if self.settings.premium_enabled {
+            if let Some(why) = self.settings.premium_blocker() {
+                self.premium_gate = true;
+                self.toast(&why);
+                return;
+            }
         }
         let premium_relay = match self.settings.host_relay() {
             Ok(r) => r,
@@ -242,8 +257,10 @@ impl UnifiedRemoteApp {
             }
         };
         let cfg = HostServerConfig {
-            bind_addr: format!("0.0.0.0:{}", port),
-            password: self.host_password.clone(),
+            // Without "Direct connections" the plain TCP port listens on this PC only, so
+            // nothing is exposed and Windows has nothing to ask about.
+            bind_addr: format!("{}:{}", if self.host_direct { "0.0.0.0" } else { "127.0.0.1" }, port),
+            password: self.settings.host_password.clone(),
             target_fps: self.host_fps,
             jpeg_quality: self.host_quality,
             audio_enabled: self.host_audio,
@@ -256,7 +273,7 @@ impl UnifiedRemoteApp {
         self.host_shutdown = Some(tx);
         self.host_running = true;
         self.host_started = Some(Instant::now());
-        self.toast("Server started");
+        self.toast("Sharing started");
         self.rt.spawn(async move {
             let _ = srv.run_with_shutdown(rx).await;
         });
@@ -268,7 +285,7 @@ impl UnifiedRemoteApp {
         }
         self.host_running = false;
         self.host_started = None;
-        self.toast("Server stopped");
+        self.toast("Sharing stopped");
     }
 
     fn connect(&mut self) {
@@ -323,8 +340,8 @@ impl UnifiedRemoteApp {
     }
 
     fn remember(&mut self, addr: &str) {
-        // Join codes expire within a day, so they are not worth saving.
-        if transport::is_join_code(addr) {
+        // Invites from a premium host expire, so they are not worth saving.
+        if transport::is_invite(addr) {
             return;
         }
         self.recents.retain(|a| a != addr);
@@ -360,10 +377,19 @@ impl eframe::App for UnifiedRemoteApp {
         if let Some(mut rx) = self.relay_test.take() {
             match rx.try_recv() {
                 Ok(r) => {
+                    let ok = r.is_ok();
                     self.relay_test_result = Some(match r {
                         Ok(m) => (true, m),
                         Err(e) => (false, e),
                     });
+                    if ok && self.activate_after_test {
+                        self.settings.premium_enabled = true;
+                        self.premium_gate = false;
+                        self.save_settings();
+                        self.relay_test_result =
+                            Some((true, "Premium unlocked and switched on. Go to Share this PC to start.".to_string()));
+                    }
+                    self.activate_after_test = false;
                 }
                 Err(oneshot::error::TryRecvError::Empty) => self.relay_test = Some(rx),
                 Err(_) => self.relay_test_result = Some((false, "The test did not finish.".to_string())),
@@ -458,7 +484,7 @@ impl eframe::App for UnifiedRemoteApp {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0f32;
                         ui.label(RichText::new("Remote Desktop").size(13.5f32).strong());
-                        ui.label(RichText::new("over Tailscale").size(10.5f32).color(C.text_faint));
+                        ui.label(RichText::new("Share or control a PC").size(10.5f32).color(C.text_faint));
                     });
                 });
 
@@ -477,36 +503,15 @@ impl eframe::App for UnifiedRemoteApp {
                 {
                     self.tab = Tab::Client;
                     self.focus_addr = true;
+                    self.check_clipboard = true;
                 }
                 let premium_dot = self.settings.premium_enabled.then_some(C.amber);
-                if theme::nav_item(ui, "Premium relay", self.tab == Tab::Premium, premium_dot, theme::icon_connect)
+                if theme::nav_item(ui, "Premium", self.tab == Tab::Premium, premium_dot, theme::icon_connect)
                     .clicked()
                 {
                     self.tab = Tab::Premium;
                 }
 
-                // Network status pinned to the bottom
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    let ts = self.has_tailscale();
-                    theme::card().inner_margin(Margin::same(12.0f32)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let c = if ts { C.cyan } else { C.amber };
-                            ui.colored_label(c, RichText::new("●").size(9.0f32));
-                            ui.label(
-                                RichText::new(if ts { "Tailscale" } else { "Local network" })
-                                    .size(12.0f32)
-                                    .strong(),
-                            );
-                        });
-                        ui.label(
-                            RichText::new(self.primary_ip())
-                                .size(11.5f32)
-                                .monospace()
-                                .color(C.text_dim),
-                        );
-                    });
-                });
             });
 
         // ── Content ──
@@ -537,6 +542,12 @@ impl eframe::App for UnifiedRemoteApp {
     }
 }
 
+/// A small filled circle, drawn directly so it never depends on a font glyph.
+fn dot(ui: &mut egui::Ui, color: Color32, radius: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(radius * 2.0f32 + 4.0f32), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), radius, color);
+}
+
 fn page_header(ui: &mut egui::Ui, title: &str, sub: &str) {
     ui.label(RichText::new(title).size(24.0f32).strong());
     ui.add_space(2.0f32);
@@ -555,77 +566,135 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 impl UnifiedRemoteApp {
     fn render_host(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut copy_trigger: Option<(String, &'static str)> = None;
+        let mut start = false;
+        let mut stop = false;
+        let mut open_premium_page = false;
+        let mut open_purchase = false;
 
         page_header(
             ui,
             "Share this PC",
-            "Let another device view and control this desktop.",
+            "Let your phone or another computer see and control this PC.",
         );
 
-        // ── Status hero ──
+        // ── 1. Start / stop ──
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 // Pulsing status indicator
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0f32), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0f32), egui::Sense::hover());
                 let c = rect.center();
                 if self.host_running {
                     let t = ctx.input(|i| i.time) as f32;
                     let pulse = (t * 2.2f32).sin() * 0.5f32 + 0.5f32;
                     ui.painter()
-                        .circle_filled(c, 7.0f32 + pulse * 5.0f32, C.green.linear_multiply(0.18f32 * (1.0f32 - pulse)));
-                    ui.painter().circle_filled(c, 6.0f32, C.green);
+                        .circle_filled(c, 8.0f32 + pulse * 6.0f32, C.green.linear_multiply(0.18f32 * (1.0f32 - pulse)));
+                    ui.painter().circle_filled(c, 7.0f32, C.green);
                 } else {
-                    ui.painter().circle_stroke(c, 6.0f32, Stroke::new(1.6f32, C.text_faint));
+                    ui.painter().circle_stroke(c, 7.0f32, Stroke::new(1.8f32, C.text_faint));
                 }
 
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0f32;
                     ui.label(
                         RichText::new(if self.host_running { "Sharing is on" } else { "Sharing is off" })
-                            .size(15.0f32)
+                            .size(17.0f32)
                             .strong(),
                     );
                     let sub = match self.host_started {
-                        Some(t) if self.host_running => format!(
-                            "Running for {} · port {}",
-                            fmt_duration(t.elapsed()),
-                            self.host_port
-                        ),
-                        _ => "Start the server to accept connections.".to_string(),
+                        Some(t) if self.host_running => format!("Running for {}", fmt_duration(t.elapsed())),
+                        _ => "Press Start sharing to get an invite.".to_string(),
                     };
-                    ui.label(RichText::new(sub).size(12.0f32).color(C.text_dim));
+                    ui.label(RichText::new(sub).size(12.5f32).color(C.text_dim));
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.host_running {
-                        if theme::button(ui, "Stop sharing", BtnKind::Danger, 120.0f32).clicked() {
-                            self.stop_host();
+                        if theme::button_sized(ui, "Stop sharing", BtnKind::Danger, 150.0f32, 40.0f32, 14.0f32).clicked() {
+                            stop = true;
                         }
-                    } else if theme::button(ui, "Start sharing", BtnKind::Success, 120.0f32).clicked() {
-                        self.start_host();
+                    } else if theme::button_sized(ui, "Start sharing", BtnKind::Success, 150.0f32, 40.0f32, 14.0f32)
+                        .clicked()
+                    {
+                        start = true;
                     }
                 });
             });
         });
-
         ui.add_space(14.0f32);
 
-        // ── Connection details ──
-        let ip = self.primary_ip();
-        let port = self.host_port.trim().to_string();
-        let full_addr = format!("{}:{}", ip, port);
+        // ── 2. The invite: the one thing to send ──
+        let invite = self.settings.invite(&self.p2p_id);
+        let premium_live = self.settings.premium_enabled && self.settings.activation().is_active();
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if self.host_running {
+                ui.horizontal(|ui| {
+                    theme::section_label(ui, "Your invite");
+                    if premium_live {
+                        theme::pill(C.amber).show(ui, |ui| {
+                            ui.label(RichText::new("Premium").size(10.5f32).color(C.amber));
+                        });
+                    } else {
+                        theme::pill(C.green).show(ui, |ui| {
+                            ui.label(RichText::new("Encrypted").size(10.5f32).color(C.green));
+                        });
+                    }
+                });
+                ui.add_space(8.0f32);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(transport::display_target(&invite))
+                            .size(16.0f32)
+                            .monospace()
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button_sized(ui, "Copy invite", BtnKind::Primary, 130.0f32, 36.0f32, 13.5f32).clicked() {
+                            copy_trigger = Some((invite.clone(), "Invite copied. Now send it."));
+                        }
+                    });
+                });
+                ui.add_space(10.0f32);
+                for line in [
+                    "1. Press Copy invite.",
+                    "2. Send it to the device that will connect (WhatsApp, email, notes).",
+                    "3. There, open the app, paste the invite and press Connect.",
+                ] {
+                    ui.label(RichText::new(line).size(12.5f32).color(C.text_dim));
+                }
+                ui.add_space(8.0f32);
+                ui.label(
+                    RichText::new("Anyone with this invite can control this PC while sharing is on. Press Stop sharing to cancel it.")
+                        .size(11.5f32)
+                        .color(C.text_faint),
+                );
+            } else {
+                theme::section_label(ui, "How it works");
+                ui.add_space(8.0f32);
+                for line in [
+                    "1. Press Start sharing.",
+                    "2. Copy the invite and send it to your phone or another PC.",
+                    "3. Paste the invite in the app there and press Connect.",
+                ] {
+                    ui.label(RichText::new(line).size(13.0f32).color(C.text_dim));
+                    ui.add_space(2.0f32);
+                }
+                ui.add_space(6.0f32);
+                ui.label(
+                    RichText::new("The invite holds everything needed: no password or address to type.")
+                        .size(11.5f32)
+                        .color(C.text_faint),
+                );
+            }
+        });
+        ui.add_space(14.0f32);
 
-        // ── Pairing ID (works from any network) ──
-        let p2p_id = self.p2p_id.clone();
-
-        // ── Connection mode: standard (free public relays) or premium (your relay) ──
-        let mut open_premium_page = false;
-        let mut open_purchase = false;
+        // ── 3. Connection type ──
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::section_label(ui, "Connection");
+                theme::section_label(ui, "Connection type");
                 if self.host_running {
                     ui.label(RichText::new("· stop sharing to change").size(11.0f32).color(C.text_faint));
                 }
@@ -636,7 +705,7 @@ impl UnifiedRemoteApp {
                 theme::segmented(
                     ui,
                     &mut self.settings.premium_enabled,
-                    &[(false, "Standard"), (true, "Premium")],
+                    &[(false, "Standard (free)"), (true, "Premium")],
                 );
                 if self.settings.premium_enabled != before {
                     if self.settings.premium_enabled && self.settings.premium_blocker().is_some() {
@@ -651,9 +720,9 @@ impl UnifiedRemoteApp {
             });
             ui.add_space(6.0f32);
             let note = if self.settings.premium_enabled {
-                "Your premium relay carries the connection. Share the join code below; clients need nothing else."
+                "Your premium relay carries the connection: faster and steadier."
             } else {
-                "Free public relays. Works anywhere, but delay can be higher."
+                "Free public servers. Works anywhere, but delay can be higher."
             };
             ui.label(RichText::new(note).size(11.5f32).color(C.text_faint));
 
@@ -677,237 +746,177 @@ impl UnifiedRemoteApp {
                 });
             }
         });
+        ui.add_space(14.0f32);
+
+        // ── 4. Everything else, out of the way ──
+        let ips = self.ips.clone();
+        let pw_shown = self.show_host_pw;
+        egui::CollapsingHeader::new(RichText::new("More options").size(13.0f32).color(C.text_dim))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(6.0f32);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    // Password (already inside the invite)
+                    field_label(ui, "Password (already included in the invite)");
+                    ui.horizontal(|ui| {
+                        let shown = if pw_shown {
+                            self.settings.host_password.clone()
+                        } else {
+                            "•".repeat(self.settings.host_password.chars().count().clamp(0, 24))
+                        };
+                        ui.label(RichText::new(shown).size(14.0f32).monospace());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_enabled_ui(!self.host_running, |ui| {
+                                if theme::button_sized(ui, "New", BtnKind::Ghost, 52.0f32, 26.0f32, 12.0f32).clicked() {
+                                    self.settings.host_password = transport::random_password(12);
+                                    self.save_settings();
+                                    self.show_host_pw = true;
+                                    self.toast("New password. Old invites no longer work.");
+                                }
+                            });
+                            if theme::button_sized(ui, "Copy", BtnKind::Ghost, 52.0f32, 26.0f32, 12.0f32).clicked() {
+                                copy_trigger = Some((self.settings.host_password.clone(), "Password copied"));
+                            }
+                            let lbl = if pw_shown { "Hide" } else { "Show" };
+                            if theme::button_sized(ui, lbl, BtnKind::Ghost, 52.0f32, 26.0f32, 12.0f32).clicked() {
+                                self.show_host_pw = !self.show_host_pw;
+                            }
+                        });
+                    });
+
+                    ui.add_space(10.0f32);
+                    ui.separator();
+                    ui.add_space(8.0f32);
+
+                    // Pairing ID, for people who prefer to send ID and password separately
+                    field_label(ui, "Pairing ID (this PC's permanent address)");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(self.p2p_id.clone()).size(11.5f32).monospace()).wrap(),
+                        );
+                    });
+                    if theme::button_sized(ui, "Copy ID", BtnKind::Ghost, 80.0f32, 26.0f32, 12.0f32).clicked() {
+                        copy_trigger = Some((self.p2p_id.clone(), "Pairing ID copied"));
+                    }
+
+                    ui.add_space(10.0f32);
+                    ui.separator();
+                    ui.add_space(8.0f32);
+
+                    ui.add_enabled_ui(!self.host_running, |ui| {
+                        egui::Grid::new("host_grid")
+                            .num_columns(2)
+                            .min_col_width(130.0f32)
+                            .spacing([16.0f32, 12.0f32])
+                            .show(ui, |ui| {
+                                field_label(ui, "Frame rate");
+                                theme::segmented(ui, &mut self.host_fps, &[(30u32, "30 fps"), (60u32, "60 fps")]);
+                                ui.end_row();
+
+                                field_label(ui, "Image quality");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut self.host_quality, 50..=95).suffix("%"));
+                                });
+                                ui.end_row();
+
+                                field_label(ui, "Share audio");
+                                theme::segmented(ui, &mut self.host_audio, &[(true, "On"), (false, "Off")]);
+                                ui.end_row();
+
+                                field_label(ui, "Quality mode");
+                                let before = self.host_mode;
+                                theme::segmented(
+                                    ui,
+                                    &mut self.host_mode,
+                                    &[
+                                        (QualityMode::Auto, "Auto"),
+                                        (QualityMode::Smooth, "Smooth"),
+                                        (QualityMode::Sharp, "Sharp"),
+                                        (QualityMode::DataSaver, "Saver"),
+                                    ],
+                                );
+                                if self.host_mode != before {
+                                    self.save_settings();
+                                }
+                                ui.end_row();
+
+                                field_label(ui, "Direct connections");
+                                theme::segmented(ui, &mut self.host_direct, &[(false, "Off"), (true, "On")]);
+                                ui.end_row();
+                            });
+                    });
+                    if self.host_running {
+                        ui.add_space(4.0f32);
+                        ui.label(RichText::new("Stop sharing to change these.").size(11.0f32).color(C.text_faint));
+                    }
+
+                    if self.host_direct {
+                        ui.add_space(8.0f32);
+                        theme::banner(C.amber).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(
+                                    "Direct connections work only on the same network or Tailscale, and are not encrypted. Most people should leave this off and use the invite.",
+                                )
+                                .size(11.5f32)
+                                .color(C.amber),
+                            );
+                        });
+                        ui.add_space(6.0f32);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Port").size(12.0f32).color(C.text_dim));
+                            ui.add_enabled_ui(!self.host_running, |ui| {
+                                theme::text_field(ui, &mut self.host_port, "5885", 80.0f32, false, true);
+                            });
+                            if self.host_port_num().is_none() {
+                                ui.label(RichText::new("1-65535").size(11.0f32).color(C.red));
+                            }
+                        });
+                        let full_addr = format!("{}:{}", self.primary_ip(), self.host_port.trim());
+                        ui.add_space(4.0f32);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&full_addr).size(14.0f32).monospace().strong());
+                            if theme::button_sized(ui, "Copy", BtnKind::Ghost, 56.0f32, 26.0f32, 12.0f32).clicked() {
+                                copy_trigger = Some((full_addr.clone(), "Address copied"));
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Clients enter this address and the password above instead of the invite.")
+                                .size(11.0f32)
+                                .color(C.text_faint),
+                        );
+                    }
+
+                    ui.add_space(10.0f32);
+                    egui::CollapsingHeader::new(RichText::new("Network interfaces").size(12.0f32).color(C.text_dim))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for item in &ips {
+                                ui.horizontal(|ui| {
+                                    let c = if item.is_tailscale { C.cyan } else { C.text_faint };
+                                    dot(ui, c, 4.0f32);
+                                    ui.label(RichText::new(&item.ip).size(12.0f32).monospace());
+                                    ui.label(RichText::new(&item.label).size(11.0f32).color(C.text_faint));
+                                });
+                            }
+                        });
+                });
+            });
+
+        if start {
+            self.start_host();
+        }
+        if stop {
+            self.stop_host();
+        }
         if open_premium_page {
             self.tab = Tab::Premium;
         }
         if open_purchase {
             self.open_purchase_page();
         }
-        ui.add_space(14.0f32);
-
-        // ── What to share ──
-        let join_code = if self.settings.premium_configured() {
-            self.settings.join_code(&p2p_id)
-        } else {
-            None
-        };
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if let Some(code) = &join_code {
-                ui.horizontal(|ui| {
-                    theme::section_label(ui, "Join code · premium");
-                    theme::pill(C.amber).show(ui, |ui| {
-                        ui.label(RichText::new("Premium relay · encrypted").size(10.5f32).color(C.amber));
-                    });
-                });
-                ui.add_space(8.0f32);
-                ui.add(
-                    egui::Label::new(RichText::new(transport::display_target(code)).size(15.0f32).monospace().strong()),
-                );
-                ui.add_space(6.0f32);
-                ui.horizontal(|ui| {
-                    if theme::button_sized(ui, "Copy join code", BtnKind::Primary, 130.0f32, 28.0f32, 12.0f32).clicked() {
-                        copy_trigger = Some((code.clone(), "Join code copied"));
-                    }
-                    if theme::button_sized(ui, "Copy ID only", BtnKind::Ghost, 100.0f32, 28.0f32, 12.0f32).clicked() {
-                        copy_trigger = Some((p2p_id.clone(), "Pairing ID copied"));
-                    }
-                });
-                ui.add_space(6.0f32);
-                ui.label(
-                    RichText::new(
-                        "Send the join code and the password. The other device pastes the code and connects through your relay. The code expires after about a day; copy a fresh one when needed.",
-                    )
-                    .size(11.5f32)
-                    .color(C.text_faint),
-                );
-            } else {
-                ui.horizontal(|ui| {
-                    theme::section_label(ui, "Pairing ID · connect from anywhere");
-                    theme::pill(C.green).show(ui, |ui| {
-                        ui.label(RichText::new("Internet · encrypted").size(10.5f32).color(C.green));
-                    });
-                });
-                ui.add_space(8.0f32);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(&p2p_id).size(12.5f32).monospace().strong())
-                            .wrap(),
-                    );
-                });
-                ui.add_space(6.0f32);
-                ui.horizontal(|ui| {
-                    if theme::button_sized(ui, "Copy ID", BtnKind::Ghost, 84.0f32, 28.0f32, 12.0f32).clicked() {
-                        copy_trigger = Some((p2p_id.clone(), "Pairing ID copied"));
-                    }
-                    ui.label(
-                        RichText::new(if self.host_running {
-                            "Enter this ID and the password on the other device. No VPN or port forwarding needed."
-                        } else {
-                            "Start sharing, then enter this ID and the password on the other device."
-                        })
-                        .size(11.5f32)
-                        .color(C.text_faint),
-                    );
-                });
-            }
-        });
-
-        ui.add_space(14.0f32);
-
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::section_label(ui, "Same network or Tailscale");
-            ui.add_space(8.0f32);
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&full_addr).size(20.0f32).monospace().strong());
-                ui.add_space(6.0f32);
-                if self.has_tailscale() {
-                    theme::pill(C.cyan).show(ui, |ui| {
-                        ui.label(RichText::new("Tailscale").size(10.5f32).color(C.cyan));
-                    });
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button_sized(ui, "Copy", BtnKind::Ghost, 64.0f32, 28.0f32, 12.0f32).clicked() {
-                        copy_trigger = Some((full_addr.clone(), "Address copied"));
-                    }
-                });
-            });
-
-            ui.add_space(12.0f32);
-            ui.separator();
-            ui.add_space(8.0f32);
-
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    field_label(ui, "Password");
-                    let shown = if self.show_host_pw {
-                        self.host_password.clone()
-                    } else {
-                        "•".repeat(self.host_password.chars().count().clamp(0, 24))
-                    };
-                    ui.label(RichText::new(shown).size(15.0f32).monospace());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button_sized(ui, "Copy", BtnKind::Ghost, 64.0f32, 28.0f32, 12.0f32).clicked() {
-                        copy_trigger = Some((self.host_password.clone(), "Password copied"));
-                    }
-                    let lbl = if self.show_host_pw { "Hide" } else { "Show" };
-                    if theme::button_sized(ui, lbl, BtnKind::Ghost, 64.0f32, 28.0f32, 12.0f32).clicked() {
-                        self.show_host_pw = !self.show_host_pw;
-                    }
-                });
-            });
-
-            if !self.has_tailscale() {
-                ui.add_space(10.0f32);
-                theme::banner(C.amber).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("Tailscale was not detected. This address only works on your local network. Use the Pairing ID above to connect from anywhere.")
-                            .size(12.0f32)
-                            .color(C.amber),
-                    );
-                });
-            }
-        });
-
-        ui.add_space(14.0f32);
-
-        // ── Settings ──
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::section_label(ui, "Settings");
-                if self.host_running {
-                    ui.label(RichText::new("· stop sharing to change").size(11.0f32).color(C.text_faint));
-                }
-            });
-            ui.add_space(8.0f32);
-
-            ui.add_enabled_ui(!self.host_running, |ui| {
-                egui::Grid::new("host_grid")
-                    .num_columns(2)
-                    .min_col_width(100.0f32)
-                    .spacing([16.0f32, 14.0f32])
-                    .show(ui, |ui| {
-                        field_label(ui, "Password");
-                        ui.horizontal(|ui| {
-                            theme::text_field(ui, &mut self.host_password, "password", 170.0f32, !self.show_host_pw, false);
-                            if theme::button_sized(ui, "Generate", BtnKind::Ghost, 0.0f32, 30.0f32, 12.0f32).clicked() {
-                                self.host_password = random_password(12);
-                                self.show_host_pw = true;
-                                self.toast("New password generated");
-                            }
-                        });
-                        ui.end_row();
-
-                        field_label(ui, "Port");
-                        ui.horizontal(|ui| {
-                            let bad = self.host_port_num().is_none();
-                            theme::text_field(ui, &mut self.host_port, "5885", 80.0f32, false, true);
-                            if bad {
-                                ui.label(RichText::new("1-65535").size(11.0f32).color(C.red));
-                            }
-                        });
-                        ui.end_row();
-
-                        field_label(ui, "Frame rate");
-                        theme::segmented(ui, &mut self.host_fps, &[(30u32, "30 fps"), (60u32, "60 fps")]);
-                        ui.end_row();
-
-                        field_label(ui, "Image quality");
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Slider::new(&mut self.host_quality, 50..=95).suffix("%"));
-                        });
-                        ui.end_row();
-
-                        field_label(ui, "Share audio");
-                        theme::segmented(ui, &mut self.host_audio, &[(true, "On"), (false, "Off")]);
-                        ui.end_row();
-
-                        field_label(ui, "Quality mode");
-                        let before = self.host_mode;
-                        theme::segmented(
-                            ui,
-                            &mut self.host_mode,
-                            &[
-                                (QualityMode::Auto, "Auto"),
-                                (QualityMode::Smooth, "Smooth"),
-                                (QualityMode::Sharp, "Sharp"),
-                                (QualityMode::DataSaver, "Saver"),
-                            ],
-                        );
-                        if self.host_mode != before {
-                            self.save_settings();
-                        }
-                        ui.end_row();
-                    });
-            });
-        });
-
-        ui.add_space(14.0f32);
-
-        // ── Network interfaces ──
-        let ips = self.ips.clone();
-        egui::CollapsingHeader::new(RichText::new("Network interfaces").size(12.0f32).color(C.text_dim))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add_space(4.0f32);
-                for item in &ips {
-                    ui.horizontal(|ui| {
-                        let c = if item.is_tailscale { C.cyan } else { C.text_faint };
-                        ui.colored_label(c, RichText::new("●").size(8.0f32));
-                        ui.label(RichText::new(&item.ip).size(12.0f32).monospace());
-                        ui.label(RichText::new(&item.label).size(11.0f32).color(C.text_faint));
-                        if theme::button_sized(ui, "Copy", BtnKind::Ghost, 0.0f32, 22.0f32, 11.0f32).clicked() {
-                            copy_trigger = Some((item.ip.clone(), "IP copied"));
-                        }
-                    });
-                }
-            });
-
         if let Some((txt, msg)) = copy_trigger {
             self.copy(ctx, &txt, msg);
         }
@@ -923,45 +932,128 @@ impl UnifiedRemoteApp {
         page_header(
             ui,
             "Connect to a PC",
-            "Paste the join code or Pairing ID (or an address) and the password shown on the host.",
+            "Paste the invite you received from the PC you want to control.",
         );
 
+        // Look at the clipboard once each time this page opens.
+        if self.check_clipboard {
+            self.check_clipboard = false;
+            self.clipboard_invite = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut c| c.get_text().ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| transport::is_invite(t) && transport::resolve_target(t).is_ok());
+        }
+
         let mut submit = false;
+        let mut paste = false;
+        let mut use_clipboard = false;
+        let mut clear_invite = false;
+
+        // What the field currently holds.
+        let invite_info = if transport::is_invite(&self.client_addr) {
+            transport::resolve_target(&self.client_addr).ok()
+        } else {
+            None
+        };
+        let has_invite = invite_info.is_some();
+        let invite_has_password = invite_info.as_ref().map(|t| t.password.is_some()).unwrap_or(false);
+        let invite_premium = invite_info.as_ref().map(|t| t.premium.is_some()).unwrap_or(false);
 
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add_enabled_ui(!self.connecting, |ui| {
-                field_label(ui, "Join code, Pairing ID or address");
-                let w = ui.available_width();
-                let r = theme::text_field(ui, &mut self.client_addr, "Paste a join code or Pairing ID", w, false, true);
-                if self.focus_addr {
-                    r.request_focus();
-                    self.focus_addr = false;
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
 
-                ui.add_space(6.0f32);
-                field_label(ui, "Password");
-                ui.horizontal(|ui| {
-                    let w = ui.available_width() - 76.0f32;
-                    let r = theme::text_field(
-                        ui,
-                        &mut self.client_password,
-                        "password",
-                        w.max(120.0f32),
-                        !self.show_client_pw,
-                        false,
-                    );
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        submit = true;
-                    }
-                    let lbl = if self.show_client_pw { "Hide" } else { "Show" };
-                    if theme::button_sized(ui, lbl, BtnKind::Ghost, 64.0f32, 34.0f32, 12.0f32).clicked() {
-                        self.show_client_pw = !self.show_client_pw;
+            if self.client_addr.trim().is_empty() && !self.connecting && self.clipboard_invite.is_some() {
+                theme::banner(C.green).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("An invite is on your clipboard.").size(12.5f32).color(C.green));
+                    ui.add_space(4.0f32);
+                    if theme::button_sized(ui, "Connect with it", BtnKind::Success, 140.0f32, 30.0f32, 12.5f32).clicked() {
+                        use_clipboard = true;
                     }
                 });
+                ui.add_space(12.0f32);
+            }
+
+            ui.add_enabled_ui(!self.connecting, |ui| {
+                if has_invite {
+                    // A pasted invite is shown as one tidy line instead of a wall of text.
+                    field_label(ui, "Invite");
+                    ui.horizontal(|ui| {
+                        ui.colored_label(C.green, RichText::new("✓").size(15.0f32));
+                        ui.label(
+                            RichText::new(transport::display_target(&self.client_addr))
+                                .size(14.0f32)
+                                .monospace()
+                                .strong(),
+                        );
+                        if invite_premium {
+                            theme::pill(C.amber).show(ui, |ui| {
+                                ui.label(RichText::new("Premium").size(10.5f32).color(C.amber));
+                            });
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button_sized(ui, "Change", BtnKind::Ghost, 70.0f32, 26.0f32, 12.0f32).clicked() {
+                                clear_invite = true;
+                            }
+                        });
+                    });
+                } else {
+                    field_label(ui, "Invite, Pairing ID or address");
+                    ui.horizontal(|ui| {
+                        let w = ui.available_width() - 104.0f32;
+                        let r = theme::text_field(
+                            ui,
+                            &mut self.client_addr,
+                            "Paste the invite here",
+                            w.max(140.0f32),
+                            false,
+                            true,
+                        );
+                        if self.focus_addr {
+                            r.request_focus();
+                            self.focus_addr = false;
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                        if theme::button_sized(ui, "Paste", BtnKind::Primary, 76.0f32, 34.0f32, 12.5f32).clicked() {
+                            paste = true;
+                        }
+                    });
+                }
+
+                // The password is only asked for when the invite did not carry it.
+                let typed_something = !self.client_addr.trim().is_empty();
+                if typed_something && !(has_invite && invite_has_password) {
+                    ui.add_space(8.0f32);
+                    field_label(ui, "Password");
+                    ui.horizontal(|ui| {
+                        let w = ui.available_width() - 92.0f32;
+                        let r = theme::text_field(
+                            ui,
+                            &mut self.client_password,
+                            "password",
+                            w.max(120.0f32),
+                            !self.show_client_pw,
+                            false,
+                        );
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                        let lbl = if self.show_client_pw { "Hide" } else { "Show" };
+                        if theme::button_sized(ui, lbl, BtnKind::Ghost, 64.0f32, 34.0f32, 12.0f32).clicked() {
+                            self.show_client_pw = !self.show_client_pw;
+                        }
+                    });
+                    if has_invite {
+                        ui.label(
+                            RichText::new("This invite is from an older version and has no password in it.")
+                                .size(11.0f32)
+                                .color(C.text_faint),
+                        );
+                    }
+                }
             });
 
             if !self.client_msg.is_empty() {
@@ -981,7 +1073,7 @@ impl UnifiedRemoteApp {
                         .pending
                         .as_ref()
                         .map(|p| transport::display_target(&p.addr))
-                        .unwrap_or_else(|| "host".to_string());
+                        .unwrap_or_else(|| "the PC".to_string());
                     ui.label(
                         RichText::new(format!("Connecting to {}…", addr))
                             .size(12.5f32)
@@ -995,12 +1087,38 @@ impl UnifiedRemoteApp {
                 });
             } else {
                 let w = ui.available_width();
-                if theme::button_sized(ui, "Connect", BtnKind::Primary, w, 38.0f32, 14.0f32).clicked() {
-                    submit = true;
-                }
+                let ready = !self.client_addr.trim().is_empty();
+                ui.add_enabled_ui(ready, |ui| {
+                    if theme::button_sized(ui, "Connect", BtnKind::Primary, w, 40.0f32, 14.0f32).clicked() {
+                        submit = true;
+                    }
+                });
             }
         });
 
+        if clear_invite {
+            self.client_addr.clear();
+            self.client_msg.clear();
+            self.focus_addr = true;
+        }
+        if paste {
+            if let Some(text) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                self.client_addr = text.trim().to_string();
+                self.client_msg.clear();
+                if transport::is_invite(&self.client_addr) {
+                    self.toast("Invite pasted");
+                }
+            } else {
+                self.toast("Nothing to paste: copy the invite first");
+            }
+        }
+        if use_clipboard {
+            if let Some(inv) = self.clipboard_invite.clone() {
+                self.client_addr = inv;
+                self.client_msg.clear();
+                submit = true;
+            }
+        }
         if submit {
             self.connect();
         }
@@ -1071,48 +1189,70 @@ impl UnifiedRemoteApp {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Premium page (host setup)
+// Premium page
 // ═════════════════════════════════════════════════════════════════════════════
 
 impl UnifiedRemoteApp {
     fn render_premium(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         page_header(
             ui,
-            "Premium relay",
-            "Run this PC's connections through your own relay server for lower delay and steadier quality.",
+            "Premium",
+            "Faster, steadier connections through the premium relay server.",
         );
 
         let mut changed = false;
+        let mut activate = false;
         let mut run_test = false;
         let mut clear = false;
         let mut subscribe = false;
 
+        let activation = self.settings.activation();
+        let (status_color, headline) = match &activation {
+            transport::Activation::Active { .. } => (C.green, "Premium is unlocked"),
+            transport::Activation::NotSet => (C.text_faint, "Premium is not unlocked"),
+            transport::Activation::Expired { .. } => (C.amber, "Your subscription has ended"),
+            transport::Activation::Invalid(_) => (C.amber, "That code is not valid"),
+        };
+
+        // ── Status ──
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section_label(ui, "Set up this PC as a premium host");
-            ui.add_space(8.0f32);
-
-            field_label(ui, "Relay URL");
-            let w = ui.available_width();
-            changed |= theme::text_field(
-                ui,
-                &mut self.settings.premium_url,
-                "https://your-relay.onrender.com",
-                w,
-                false,
-                true,
-            )
-            .changed();
-
-            ui.add_space(6.0f32);
-            field_label(ui, "Coupon or licence code");
             ui.horizontal(|ui| {
-                let w = ui.available_width() - 76.0f32;
+                dot(ui, status_color, 6.0f32);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0f32;
+                    ui.label(RichText::new(headline).size(16.0f32).strong());
+                    ui.label(RichText::new(activation.describe()).size(12.0f32).color(C.text_dim));
+                });
+                if self.settings.premium_enabled && activation.is_active() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::pill(C.amber).show(ui, |ui| {
+                            ui.label(RichText::new("In use").size(10.5f32).color(C.amber));
+                        });
+                    });
+                }
+            });
+        });
+        ui.add_space(14.0f32);
+
+        // ── Activate ──
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_label(ui, "Unlock Premium");
+            ui.add_space(8.0f32);
+            ui.label(
+                RichText::new("Enter the coupon or licence code you were given.")
+                    .size(12.5f32)
+                    .color(C.text_dim),
+            );
+            ui.add_space(8.0f32);
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 92.0f32;
                 changed |= theme::text_field(
                     ui,
                     &mut self.settings.premium_license,
-                    "RRPC-… coupon or rrpc-lic2.… licence",
-                    w.max(120.0f32),
+                    "RRPC-… or rrpc-lic2.…",
+                    w.max(140.0f32),
                     !self.show_relay_key,
                     false,
                 )
@@ -1122,39 +1262,19 @@ impl UnifiedRemoteApp {
                     self.show_relay_key = !self.show_relay_key;
                 }
             });
-
-            // Status of the code that was entered
-            ui.add_space(8.0f32);
-            let activation = self.settings.activation();
-            let status_color = match &activation {
-                transport::Activation::Active { .. } => C.green,
-                transport::Activation::NotSet => C.text_dim,
-                _ => C.amber,
-            };
-            ui.label(RichText::new(activation.describe()).size(12.5f32).color(status_color));
-
-            ui.add_space(12.0f32);
+            ui.add_space(10.0f32);
             ui.horizontal(|ui| {
-                let configured = self.settings.premium_configured() && activation.is_active();
-                ui.add_enabled_ui(configured && self.relay_test.is_none(), |ui| {
-                    if theme::button(ui, "Test connection", BtnKind::Primary, 140.0f32).clicked() {
-                        run_test = true;
+                ui.add_enabled_ui(!self.settings.premium_license.trim().is_empty() && self.relay_test.is_none(), |ui| {
+                    if theme::button_sized(ui, "Activate", BtnKind::Primary, 120.0f32, 36.0f32, 13.5f32).clicked() {
+                        activate = true;
                     }
                 });
-                ui.add_enabled_ui(
-                    !self.settings.premium_license.is_empty() || self.settings.premium_url != transport::DEFAULT_PREMIUM_URL,
-                    |ui| {
-                        if theme::button(ui, "Clear", BtnKind::Ghost, 80.0f32).clicked() {
-                            clear = true;
-                        }
-                    },
-                );
-                if theme::button(ui, "Subscribe / renew", BtnKind::Ghost, 140.0f32).clicked() {
+                if theme::button_sized(ui, "Subscribe", BtnKind::Ghost, 110.0f32, 36.0f32, 13.0f32).clicked() {
                     subscribe = true;
                 }
                 if self.relay_test.is_some() {
                     ui.spinner();
-                    ui.label(RichText::new("Testing…").size(12.5f32).color(C.accent_hover));
+                    ui.label(RichText::new("Checking…").size(12.5f32).color(C.accent_hover));
                 }
             });
 
@@ -1167,26 +1287,67 @@ impl UnifiedRemoteApp {
                 });
             }
         });
-
         ui.add_space(14.0f32);
+
+        // ── How to use it ──
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section_label(ui, "How it works");
+            theme::section_label(ui, "Then");
             ui.add_space(6.0f32);
             for line in [
-                "Premium is a paid feature. Subscribe to get a licence key, or enter a coupon code if you were given one.",
-                "1. Enter the relay URL and your coupon or licence code, then press Test connection.",
-                "2. On Share this PC, set Connection to Premium and start sharing.",
-                "3. Copy the join code and send it, with the password, to whoever should connect.",
-                "4. They paste the join code on the Connect page (or in the Android app). They need no licence or settings.",
-                "The code stays on this PC. Join codes carry a short-lived pass instead, so a leaked join code stops working on its own.",
-                "A subscription licence stops working when it ends; renew it to keep Premium. Coupons do not expire.",
-                "The code is stored on this PC in plain text.",
+                "1. Open Share this PC. Connection type is now set to Premium.",
+                "2. Press Start sharing, then Copy invite.",
+                "3. Send the invite. The other device just pastes it: no code or setting needed there.",
             ] {
-                ui.label(RichText::new(line).size(12.0f32).color(C.text_dim));
+                ui.label(RichText::new(line).size(12.5f32).color(C.text_dim));
                 ui.add_space(3.0f32);
             }
+            ui.add_space(4.0f32);
+            ui.label(
+                RichText::new("A subscription code stops working when it ends; renew it to keep Premium. Coupons do not end. The code is stored on this PC in plain text.")
+                    .size(11.5f32)
+                    .color(C.text_faint),
+            );
         });
+        ui.add_space(14.0f32);
+
+        // ── Advanced ──
+        egui::CollapsingHeader::new(RichText::new("Advanced").size(13.0f32).color(C.text_dim))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(6.0f32);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    field_label(ui, "Relay server URL");
+                    let w = ui.available_width();
+                    changed |= theme::text_field(
+                        ui,
+                        &mut self.settings.premium_url,
+                        "https://your-relay.onrender.com",
+                        w,
+                        false,
+                        true,
+                    )
+                    .changed();
+                    ui.add_space(8.0f32);
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(self.settings.premium_configured() && self.relay_test.is_none(), |ui| {
+                            if theme::button(ui, "Test connection", BtnKind::Ghost, 140.0f32).clicked() {
+                                run_test = true;
+                            }
+                        });
+                        ui.add_enabled_ui(
+                            !self.settings.premium_license.is_empty()
+                                || self.settings.premium_url != transport::DEFAULT_PREMIUM_URL,
+                            |ui| {
+                                if theme::button(ui, "Clear everything", BtnKind::Ghost, 130.0f32).clicked() {
+                                    clear = true;
+                                }
+                            },
+                        );
+                    });
+                });
+            });
 
         if changed {
             self.relay_test_result = None;
@@ -1204,21 +1365,33 @@ impl UnifiedRemoteApp {
             self.save_settings();
             self.toast("Premium settings cleared");
         }
-        if run_test {
-            let mut s = self.settings.clone();
-            s.premium_enabled = true;
-            self.relay_test_result = None;
-            match s.host_relay() {
-                Ok(Some(p)) => {
-                    let (tx, rx) = oneshot::channel();
-                    self.relay_test = Some(rx);
-                    self.rt.spawn(async move {
-                        let _ = tx.send(transport::test_premium_relay(&p).await);
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => self.relay_test_result = Some((false, e)),
+        if activate || run_test {
+            self.start_premium_check(activate);
+        }
+    }
+
+    /// Checks the code and the relay. With `activate`, success also switches the
+    /// connection type to Premium.
+    fn start_premium_check(&mut self, activate: bool) {
+        self.relay_test_result = None;
+        self.activate_after_test = false;
+        if let Some(why) = self.settings.premium_blocker() {
+            self.relay_test_result = Some((false, why));
+            return;
+        }
+        let mut s = self.settings.clone();
+        s.premium_enabled = true;
+        match s.host_relay() {
+            Ok(Some(p)) => {
+                let (tx, rx) = oneshot::channel();
+                self.relay_test = Some(rx);
+                self.activate_after_test = activate;
+                self.rt.spawn(async move {
+                    let _ = tx.send(transport::test_premium_relay(&p).await);
+                });
             }
+            Ok(None) => {}
+            Err(e) => self.relay_test_result = Some((false, e)),
         }
     }
 }
@@ -1287,8 +1460,9 @@ impl UnifiedRemoteApp {
                             let sd = ctx.input(|i| i.raw_scroll_delta);
                             if sd.y.abs() > 0.1f32 || sd.x.abs() > 0.1f32 {
                                 let _ = conn.tx_input.try_send(InputEvent::MouseScroll {
-                                    delta_x: sd.x as i32,
-                                    delta_y: sd.y as i32,
+                                    // egui reports 40 points per wheel notch; the wire format uses 120 units per notch.
+                                    delta_x: (sd.x * 3.0f32) as i32,
+                                    delta_y: (sd.y * 3.0f32) as i32,
                                 });
                             }
                         }
@@ -1369,7 +1543,7 @@ impl UnifiedRemoteApp {
                                     } else {
                                         (C.red, "Slow")
                                     };
-                                    ui.colored_label(lc, RichText::new("●").size(10.0f32));
+                                    dot(ui, lc, 5.0f32);
                                     ui.label(RichText::new(label).size(12.0f32).color(C.text));
                                     ui.label(
                                         RichText::new(format!(
@@ -1513,30 +1687,6 @@ impl UnifiedRemoteApp {
 // Helpers
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Cryptographically random password from an unambiguous alphabet.
-fn random_password(len: usize) -> String {
-    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let mut buf = vec![0u8; len];
-    if getrandom::getrandom(&mut buf).is_err() {
-        // Extremely unlikely; fall back to time-derived bytes rather than panic.
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (n >> ((i % 16) * 8)) as u8 ^ (i as u8).wrapping_mul(31);
-        }
-    }
-    // Rejection sampling avoids modulo bias.
-    let limit = 256 - (256 % ALPHABET.len());
-    buf.iter()
-        .map(|&b| {
-            let v = if (b as usize) < limit { b as usize } else { b as usize - limit };
-            ALPHABET[v % ALPHABET.len()] as char
-        })
-        .collect()
-}
-
 fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -1551,7 +1701,7 @@ fn normalize_addr(raw: &str) -> Result<String, String> {
     if transport::is_pairing_id(a) {
         return Ok(a.to_ascii_lowercase());
     }
-    if transport::is_join_code(a) {
+    if transport::is_invite(a) {
         // Validate now so a mistyped code gives an instant, clear error.
         return transport::resolve_target(a).map(|_| a.to_string());
     }

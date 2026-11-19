@@ -6,4 +6,12 @@
         <item name="android:windowBackground">@color/bg_dark</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
+
+    <!-- Shown while the app starts: dark background, white monitor mark on indigo. -->
+    <style name="Theme.RustRemotePC.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/bg_dark</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/primary_indigo</item>
+        <item name="postSplashScreenTheme">@style/Theme.RustRemotePC</item>
+    </style>
 </resources>

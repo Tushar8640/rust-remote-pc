@@ -57,6 +57,8 @@ pub enum InputEvent {
     MouseMove { x_ratio: f32, y_ratio: f32 },
     MouseDown { button: MouseBtn },
     MouseUp { button: MouseBtn },
+    /// Wheel movement in mouse-wheel units: 120 is one notch. Positive `delta_y` scrolls up
+    /// (content moves down), positive `delta_x` scrolls right. Smaller values are smooth scrolling.
     MouseScroll { delta_x: i32, delta_y: i32 },
     KeyDown { key: KeyCode },
     KeyUp { key: KeyCode },

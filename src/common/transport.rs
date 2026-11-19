@@ -97,7 +97,7 @@ pub fn quic_config() -> iroh::endpoint::QuicTransportConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::common::protocol::QualityMode;
-use premium_auth::{looks_like_join_code, mint_pass, parse_license, JoinCode, Kind, Status};
+use premium_auth::{looks_like_invite, mint_pass, parse_license, Invite, Kind, Status};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Premium relay URL compiled into this build (set `RRPC_PREMIUM_RELAY_URL` when building).
@@ -110,8 +110,8 @@ pub const DEFAULT_PREMIUM_URL: &str = match option_env!("RRPC_PREMIUM_RELAY_URL"
 /// How long the host's own relay pass lasts. The host mints a fresh one each time it
 /// starts sharing, so this only has to outlast one run.
 const HOST_PASS_TTL: u64 = 30 * 24 * 3600;
-/// How long a pass inside a join code stays valid.
-const JOIN_PASS_TTL: u64 = 24 * 3600;
+/// How long the pass inside a premium invite stays valid.
+const INVITE_PASS_TTL: u64 = 7 * 24 * 3600;
 
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -192,6 +192,9 @@ pub struct Settings {
     pub premium_url: String,
     /// The licence key (subscription) or coupon code that unlocks Premium.
     pub premium_license: String,
+    /// The password clients must present. Created on first run and kept, so an invite
+    /// stays valid across restarts.
+    pub host_password: String,
     /// Where customers buy or renew a subscription.
     pub purchase_url: String,
     /// Quality mode this PC offers to viewers by default.
@@ -206,6 +209,7 @@ impl Default for Settings {
             premium_enabled: false,
             premium_url: DEFAULT_PREMIUM_URL.to_string(),
             premium_license: String::new(),
+            host_password: String::new(),
             purchase_url: DEFAULT_PURCHASE_URL.to_string(),
             host_quality: QualityMode::Auto,
             client_quality: QualityMode::Auto,
@@ -342,50 +346,93 @@ impl Settings {
         Ok(Some(relay))
     }
 
-    /// The join code to share for a host with Pairing ID `pairing_id`, if premium is on
-    /// and unlocked.
+    /// The invite to share for a host with Pairing ID `pairing_id`: the Pairing ID and the
+    /// password, plus (when Premium is on and unlocked) the relay and a pass for it.
     ///
-    /// It carries a pass valid for about a day, so a code that leaks stops working
-    /// on its own. The expiry is rounded to the hour so the code stays stable while
-    /// it is on screen.
-    pub fn join_code(&self, pairing_id: &str) -> Option<String> {
-        if !self.premium_enabled || !self.activation().is_active() {
-            return None;
-        }
-        let license = parse_license(&self.premium_license).ok()?;
-        let hour = unix_now() / 3600 * 3600;
-        Some(
-            JoinCode {
-                pairing_id: pairing_id.to_string(),
-                relay_url: self.premium_url.trim().to_string(),
-                pass: mint_pass(&license, hour + 3600 + JOIN_PASS_TTL),
+    /// The pass lasts about a week, so an invite that leaks stops working on its own. Its
+    /// expiry is rounded to the hour so the text stays stable while it is on screen.
+    pub fn invite(&self, pairing_id: &str) -> String {
+        let mut inv = Invite {
+            pairing_id: pairing_id.to_string(),
+            password: self.host_password.clone(),
+            relay_url: String::new(),
+            pass: String::new(),
+        };
+        if self.premium_enabled && self.activation().is_active() {
+            if let Ok(license) = parse_license(&self.premium_license) {
+                let hour = unix_now() / 3600 * 3600;
+                inv.relay_url = self.premium_url.trim().to_string();
+                inv.pass = mint_pass(&license, hour + 3600 + INVITE_PASS_TTL);
             }
-            .encode(),
-        )
+        }
+        inv.encode()
+    }
+
+    /// Makes sure a host password exists, creating one if needed. Returns true if it changed.
+    pub fn ensure_host_password(&mut self) -> bool {
+        if self.host_password.trim().is_empty() {
+            self.host_password = random_password(12);
+            true
+        } else {
+            false
+        }
     }
 }
 
-/// True if `s` is a join code from a premium host.
-pub fn is_join_code(s: &str) -> bool {
-    looks_like_join_code(s)
+/// A cryptographically random password from an unambiguous alphabet.
+pub fn random_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let mut buf = vec![0u8; len];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Extremely unlikely; fall back to time-derived bytes rather than panic.
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (n >> ((i % 16) * 8)) as u8 ^ (i as u8).wrapping_mul(31);
+        }
+    }
+    // Rejection sampling avoids modulo bias.
+    let limit = 256 - (256 % ALPHABET.len());
+    buf.iter()
+        .map(|&b| {
+            let v = if (b as usize) < limit { b as usize } else { b as usize - limit };
+            ALPHABET[v % ALPHABET.len()] as char
+        })
+        .collect()
 }
 
-/// Splits a connection target into the Pairing ID to dial and, for a join code, the
-/// premium relay (with its pass) to use.
-pub fn resolve_target(target: &str) -> Result<(String, Option<PremiumRelay>), String> {
-    if looks_like_join_code(target) {
-        let jc = JoinCode::decode(target)
-            .ok_or_else(|| "That join code is not valid. Copy it again from the PC.".to_string())?;
-        return Ok((jc.pairing_id, Some(PremiumRelay { url: jc.relay_url, key: jc.pass })));
+/// True if `s` is an invite copied from a host.
+pub fn is_invite(s: &str) -> bool {
+    looks_like_invite(s)
+}
+
+/// What a connection target (what the user typed or pasted) turns out to be.
+pub struct Target {
+    /// The Pairing ID or `host:port` to dial.
+    pub address: String,
+    /// For an invite from a premium host: the relay and the pass that admits us.
+    pub premium: Option<PremiumRelay>,
+    /// For an invite: the host password it carries (empty if it has none).
+    pub password: Option<String>,
+}
+
+/// Splits a connection target into what to dial and, for an invite, the password and
+/// premium relay it carries.
+pub fn resolve_target(target: &str) -> Result<Target, String> {
+    if looks_like_invite(target) {
+        let inv = Invite::decode(target)
+            .ok_or_else(|| "That invite is not valid. Copy it again from the PC.".to_string())?;
+        let premium = inv.has_relay().then(|| PremiumRelay { url: inv.relay_url.clone(), key: inv.pass.clone() });
+        let password = (!inv.password.is_empty()).then(|| inv.password.clone());
+        return Ok(Target { address: inv.pairing_id, premium, password });
     }
-    Ok((target.trim().to_string(), None))
+    Ok(Target { address: target.trim().to_string(), premium: None, password: None })
 }
 
 /// Shortens an address for display; join codes are marked as premium.
 pub fn display_target(s: &str) -> String {
-    if looks_like_join_code(s) {
+    if looks_like_invite(s) {
         let t = s.trim();
-        return format!("Premium join code …{}", &t[t.len().saturating_sub(6)..]);
+        return format!("Invite …{}", &t[t.len().saturating_sub(6)..]);
     }
     display_addr(s)
 }
@@ -411,6 +458,7 @@ pub fn load_settings() -> Settings {
                 "premium_enabled" => s.premium_enabled = parse_bool(v),
                 "premium_url" if !v.is_empty() => s.premium_url = v.to_string(),
                 "premium_license" => s.premium_license = v.to_string(),
+                "host_password" => s.host_password = v.to_string(),
                 "purchase_url" if !v.is_empty() => s.purchase_url = v.to_string(),
                 "host_quality" => s.host_quality = QualityMode::parse(v).unwrap_or_default(),
                 "client_quality" => s.client_quality = QualityMode::parse(v).unwrap_or_default(),
@@ -436,10 +484,11 @@ pub fn save_settings(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let text = format!(
-        "premium_enabled={}\npremium_url={}\npremium_license={}\npurchase_url={}\nhost_quality={}\nclient_quality={}\n",
+        "premium_enabled={}\npremium_url={}\npremium_license={}\nhost_password={}\npurchase_url={}\nhost_quality={}\nclient_quality={}\n",
         s.premium_enabled,
         s.premium_url.trim(),
         s.premium_license.trim(),
+        s.host_password.trim(),
         s.purchase_url.trim(),
         quality_key(s.host_quality),
         quality_key(s.client_quality),
@@ -478,7 +527,9 @@ mod tests {
         assert_eq!(s.activation(), Activation::NotSet);
         assert!(s.premium_blocker().is_some());
         assert!(s.host_relay().is_err());
-        assert!(s.join_code(&"ab".repeat(32)).is_none());
+        // Not activated: an invite still works but carries no relay.
+        let inv = Invite::decode(&s.invite(&"ab".repeat(32))).unwrap();
+        assert!(!inv.has_relay());
         // Garbage: blocked.
         s.premium_license = "not-a-code".into();
         assert!(matches!(s.activation(), Activation::Invalid(_)));
@@ -496,8 +547,10 @@ mod tests {
         s.premium_license = premium_auth::issue_coupon(secret, "owner").unwrap();
         assert!(s.activation().is_active());
         assert!(s.host_relay().unwrap().is_some());
-        let code = s.join_code(&"ab".repeat(32)).unwrap();
-        assert!(JoinCode::decode(&code).is_some());
+        s.host_password = "secret-pw".into();
+        let inv = Invite::decode(&s.invite(&"ab".repeat(32))).unwrap();
+        assert!(inv.has_relay(), "an activated premium host puts its relay in the invite");
+        assert_eq!(inv.password, "secret-pw");
 
         s.premium_license = premium_auth::issue_license(secret, "acme", unix_now() + 86_400).unwrap();
         assert!(s.activation().is_active());
@@ -507,7 +560,32 @@ mod tests {
         assert!(matches!(s.activation(), Activation::Expired { .. }));
         assert!(s.premium_blocker().unwrap().contains("Renew"));
         assert!(s.host_relay().is_err());
-        assert!(s.join_code(&"ab".repeat(32)).is_none());
+        let inv = Invite::decode(&s.invite(&"ab".repeat(32))).unwrap();
+        assert!(!inv.has_relay(), "an ended subscription must not hand out relay passes");
+    }
+
+    #[test]
+    fn invites_resolve_to_a_target() {
+        let mut s = Settings::default();
+        s.host_password = "pw 1".into();
+        let t = resolve_target(&s.invite(&"cd".repeat(32))).unwrap();
+        assert_eq!(t.address, "cd".repeat(32));
+        assert_eq!(t.password.as_deref(), Some("pw 1"));
+        assert!(t.premium.is_none());
+        // A plain address is passed through untouched.
+        let t = resolve_target("  100.64.0.1:5885 ").unwrap();
+        assert_eq!((t.address.as_str(), t.password, t.premium), ("100.64.0.1:5885", None, None));
+        assert!(resolve_target("rrpc2.broken").is_err());
+    }
+
+    #[test]
+    fn host_password_is_created_once() {
+        let mut s = Settings::default();
+        assert!(s.ensure_host_password());
+        let first = s.host_password.clone();
+        assert_eq!(first.len(), 12);
+        assert!(!s.ensure_host_password());
+        assert_eq!(s.host_password, first);
     }
 
     #[test]

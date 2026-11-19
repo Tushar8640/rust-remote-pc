@@ -122,12 +122,11 @@ cd android-client; .\gradlew.bat assembleRelease
 
 ## Premium (নিজের রিলে সার্ভার, Render এ ডিপ্লয়)
 
-**হোস্ট** "Share this PC" এ Connection = **Premium** বেছে নিলে অ্যাপ নিজেই আপনার রিলে সার্ভার ব্যবহার করে। হোস্ট একটি **join code** কপি করে পাসওয়ার্ডসহ শেয়ার করে; **ক্লায়েন্ট** (Desktop বা Android) শুধু সেই কোড পেস্ট করে জয়েন করে, কোনো সেটিং বা লাইসেন্স লাগে না।
-
+**হোস্ট** "Share this PC" এ Connection type = **Premium** বেছে নিলে অ্যাপ নিজেই আপনার রিলে সার্ভার ব্যবহার করে। যে ডিভাইস কানেক্ট করবে তাকে শুধু **invite** পাঠান; সেখানে কোনো লাইসেন্স বা সেটিং লাগে না।
 - সার্ভার ডিপ্লয় (Render), লাইসেন্স ইস্যু, রিভোক: [`relay-server/README.md`](relay-server/README.md) এবং রুটের `render.yaml`।
 - হোস্ট সেটআপ: Desktop এ **Premium relay** পেজে URL ও licence key দিয়ে "Test connection"।
 - লাইসেন্স ইস্যু: `premium-relay.exe issue <customer-id>` (`RELAY_SECRET` সহ)।
-- হেডলেস: `RRPC_PREMIUM=1`, `RRPC_PREMIUM_URL`, `RRPC_PREMIUM_LICENSE` সেট করে `host`; `rust-remote-pc join-code` নতুন কোড ছাপে।
+- হেডলেস: `RRPC_PREMIUM=1`, `RRPC_PREMIUM_URL`, `RRPC_PREMIUM_LICENSE` সেট করে `host`; `rust-remote-pc invite` নতুন কোড ছাপে।
 
 ### Premium কিভাবে পাওয়া যায় (coupon / subscription)
 
@@ -136,3 +135,28 @@ Premium চালু করতে অ্যাক্টিভেশন কোড
 - **Coupon** (শুধু মালিকের জন্য, ফ্রি, মেয়াদ নেই): `premium-relay.exe coupon owner`
 - **Licence key** (গ্রাহকের সাবস্ক্রিপশন, মেয়াদ আছে): `premium-relay.exe issue <customer-id> --days 30`
 - পেমেন্ট সিস্টেম বিল্ট-ইন নেই। Subscribe বাটন `RRPC_PURCHASE_URL` (বিল্ড টাইমে) বা `settings.txt` এর `purchase_url` এ থাকা পেজ খোলে; গ্রাহক পেমেন্ট করলে আপনি `issue` চালিয়ে কী পাঠান। বিস্তারিত: [`relay-server/README.md`](relay-server/README.md)।
+
+## Android জেসচার
+
+| জেসচার | কাজ |
+|---|---|
+| এক ট্যাপ | এক ক্লিক |
+| পরপর দুই ট্যাপ (প্রায় একই জায়গায়) | ডাবল ক্লিক |
+| লং প্রেস | রাইট ক্লিক |
+| দুই আঙুলে ড্র্যাগ | স্ক্রল (উপর-নিচ ও ডান-বাম) |
+| দুই আঙুলে পিঞ্চ | জুম |
+| এক আঙুলে ড্র্যাগ | Direct touch এ বাম বাটন ধরে টানা; Trackpad এ কার্সর সরানো |
+
+স্ক্রল ও জুম দুই মোডেই (Touch/Trackpad) কাজ করে। জেসচার টেস্ট: `cd android-client; .\gradlew.bat connectedDebugAndroidTest` (এমুলেটর বা ফোন চালু থাকতে হবে)। হোস্ট স্ক্রল টেস্ট: `rust-remote-pc check -H <ID> -p <pw> --scroll-y 120`।
+
+## সহজ ব্যবহার (Invite)
+
+কানেক্ট করতে ৩টা ধাপ, কোনো IP/পোর্ট/ID/পাসওয়ার্ড টাইপ করা লাগে না:
+
+1. **যে পিসি কন্ট্রোল হবে (হোস্ট):** অ্যাপ খুলে **Start sharing** চাপুন, তারপর **Copy invite**।
+2. Invite টা ফোন বা অন্য পিসিতে পাঠান (WhatsApp, ইমেইল, নোট)।
+3. **যে ডিভাইস কন্ট্রোল করবে:** অ্যাপ খুলে **Paste invite** চাপুন, তারপর **Connect**। Android এ ক্লিপবোর্ডে invite থাকলে অ্যাপ নিজেই "Connect with it" দেখায়।
+
+Invite এ পিসির ঠিকানা, পাসওয়ার্ড এবং (Premium হলে) রিলে ও তার পাস আছে, তাই ইনভাইট যার কাছে আছে সে শেয়ারিং চলা পর্যন্ত পিসি চালাতে পারে; Stop sharing করলে বা পাসওয়ার্ড বদলালে পুরনো invite অকেজো হয়। পাসওয়ার্ড একবার তৈরি হয়ে সেভ থাকে, তাই রিস্টার্টের পরও invite চলে। হেডলেস: `rust-remote-pc host` শুরুতেই invite ছাপে; `rust-remote-pc invite` নতুন করে ছাপে।
+
+নেটওয়ার্ক ঠিকানা (IP:port) দিয়ে সরাসরি কানেকশন **More options → Direct connections** এ আছে, ডিফল্টে বন্ধ (পোর্ট খোলা হয় না)।

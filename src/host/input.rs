@@ -20,6 +20,48 @@ impl HostInputExecutor {
         })
     }
 
+    /// Sends a wheel movement of `delta` units (120 = one notch; +up / +right).
+    ///
+    /// On Windows the raw delta is sent, so small finger movements on a touch screen turn
+    /// into smooth sub-notch scrolling. Other platforms only accept whole notches.
+    fn wheel(&mut self, delta: i32, horizontal: bool) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+            };
+            let _ = &self.enigo;
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: delta as u32,
+                        dwFlags: if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            // SAFETY: `input` is a valid INPUT and the size matches the struct passed.
+            unsafe {
+                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let notches = (delta as f32 / 120.0).round() as i32;
+            let notches = if notches == 0 { delta.signum() } else { notches };
+            if horizontal {
+                let _ = self.enigo.scroll(notches, enigo::Axis::Horizontal);
+            } else {
+                // enigo: positive scrolls down
+                let _ = self.enigo.scroll(-notches, enigo::Axis::Vertical);
+            }
+        }
+    }
+
     pub fn update_resolution(&mut self, width: u32, height: u32) {
         self.screen_width = width;
         self.screen_height = height;
@@ -48,8 +90,14 @@ impl HostInputExecutor {
                 };
                 let _ = self.enigo.button(btn, Direction::Release);
             }
-            InputEvent::MouseScroll { delta_x: _, delta_y } => {
-                let _ = self.enigo.scroll(delta_y, enigo::Axis::Vertical);
+            InputEvent::MouseScroll { delta_x, delta_y } => {
+                // Wire units are mouse-wheel units: 120 per notch, +y = up, +x = right.
+                if delta_y != 0 {
+                    self.wheel(delta_y, false);
+                }
+                if delta_x != 0 {
+                    self.wheel(delta_x, true);
+                }
             }
             InputEvent::KeyDown { key } => {
                 if let Some(enigo_key) = map_key(&key) {

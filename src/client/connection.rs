@@ -151,9 +151,12 @@ pub async fn connect_to_host(
     frame_sender: mpsc::Sender<DecodedFrameMessage>,
     opts: ConnectOptions,
 ) -> Result<ConnectionHandle> {
-    // A join code carries the host's Pairing ID and the premium relay (plus a pass) to meet on.
-    let (target, from_code) = resolve_target(host_addr).map_err(|e| anyhow!(e))?;
-    let premium = from_code.or(opts.premium.clone());
+    // An invite carries the host's Pairing ID, its password and, for a premium host, the relay
+    // (plus a pass) to meet on.
+    let resolved = resolve_target(host_addr).map_err(|e| anyhow!(e))?;
+    let target = resolved.address;
+    let premium = resolved.premium.or(opts.premium.clone());
+    let password = resolved.password.as_deref().unwrap_or(password);
     let (mut socket_read, mut socket_write, keepalive, link) =
         open_transport(&target, premium.as_ref()).await?;
 

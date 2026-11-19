@@ -35,6 +35,20 @@ class ConnectionPreferences(context: Context) {
         get() = prefs.getInt("quality_mode", 0)
         set(value) = prefs.edit().putInt("quality_mode", value).apply()
 
+    /** Look of the draggable ping/fps badge in the viewer. */
+    var hudOpacity: Float
+        get() = prefs.getFloat("hud_opacity", 0.9f)
+        set(value) = prefs.edit().putFloat("hud_opacity", value).apply()
+
+    /** Badge position as a pixel offset from its default spot (top centre). */
+    var hudOffsetX: Float
+        get() = prefs.getFloat("hud_x", 0f)
+        set(value) = prefs.edit().putFloat("hud_x", value).apply()
+
+    var hudOffsetY: Float
+        get() = prefs.getFloat("hud_y", 0f)
+        set(value) = prefs.edit().putFloat("hud_y", value).apply()
+
     fun getRecentHosts(): List<String> {
         val raw = prefs.getString("recent_hosts", "") ?: ""
         return if (raw.isBlank()) emptyList() else raw.split(",").filter { it.isNotBlank() }

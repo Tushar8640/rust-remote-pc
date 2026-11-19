@@ -13,6 +13,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -24,7 +25,9 @@ fun StatBadge(
     stats: ConnectionStats,
     audioActive: Boolean,
     audioMuted: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** 0..1, applied to the whole pill. */
+    alpha: Float = 1f
 ) {
     val (quality, qualityColor) = when {
         stats.rttMs == 0L -> "Live" to AccentIndigoLight
@@ -35,6 +38,7 @@ fun StatBadge(
 
     Row(
         modifier = modifier
+            .alpha(alpha)
             .clip(RoundedCornerShape(20.dp))
             .background(BgDark.copy(alpha = 0.82f))
             .border(1.dp, BorderDark, RoundedCornerShape(20.dp))

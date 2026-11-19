@@ -30,7 +30,8 @@ type HmacSha256 = Hmac<Sha256>;
 const LICENSE_PREFIX_V1: &str = "rrpc-lic1";
 const LICENSE_PREFIX_V2: &str = "rrpc-lic2";
 const COUPON_PREFIX: &str = "RRPC-";
-const JOIN_PREFIX: &str = "rrpc1.";
+const JOIN_PREFIX: &str = "rrpc1."; // older invites without a password
+const INVITE_PREFIX: &str = "rrpc2.";
 const PASS_MAC_LEN: usize = 16;
 /// Marker in a pass for "signed with a coupon-derived key".
 const COUPON_MARK: &str = "c";
@@ -370,41 +371,80 @@ pub fn verify_pass(
     Ok(id.to_string())
 }
 
-// ── Join codes ──────────────────────────────────────────────────────────────
+// ── Invites ─────────────────────────────────────────────────────────────────
 
-/// What a host shares so a client can connect: the host's Pairing ID, the relay
-/// to meet on, and a short-lived pass for that relay.
+/// Everything a client needs to connect, as one string a host can copy and send.
+///
+/// * `pairing_id`: which PC to reach.
+/// * `password`: the host's password, so the client does not ask for it separately.
+/// * `relay_url` / `pass`: for a premium host, the relay to meet on and a short-lived
+///   pass for it. Both empty for a standard host.
+///
+/// Anyone holding an invite can control the PC while it is shared, so treat it like a
+/// password. Invites from older versions (`rrpc1.`, no password) are still understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JoinCode {
+pub struct Invite {
     pub pairing_id: String,
+    pub password: String,
     pub relay_url: String,
     pub pass: String,
 }
 
-impl JoinCode {
-    pub fn encode(&self) -> String {
-        let raw = format!("{}|{}|{}", self.pairing_id, self.relay_url, self.pass);
-        format!("{JOIN_PREFIX}{}", BASE64URL_NOPAD.encode(raw.as_bytes()))
+impl Invite {
+    pub fn has_relay(&self) -> bool {
+        !self.relay_url.is_empty()
     }
 
-    /// Returns `None` if `s` is not a join code. Surrounding whitespace is ignored.
+    pub fn encode(&self) -> String {
+        // Newline-separated: a single-line password can never contain one.
+        let raw = format!("{}\n{}\n{}\n{}", self.pairing_id, self.password, self.relay_url, self.pass);
+        format!("{INVITE_PREFIX}{}", BASE64URL_NOPAD.encode(raw.as_bytes()))
+    }
+
+    /// Returns `None` if `s` is not an invite. Surrounding whitespace is ignored.
     pub fn decode(s: &str) -> Option<Self> {
-        let body = s.trim().strip_prefix(JOIN_PREFIX)?;
+        let s = s.trim();
+        let (body, legacy) = match s.strip_prefix(INVITE_PREFIX) {
+            Some(b) => (b, false),
+            None => (s.strip_prefix(JOIN_PREFIX)?, true),
+        };
         let raw = String::from_utf8(BASE64URL_NOPAD.decode(body.as_bytes()).ok()?).ok()?;
-        let mut parts = raw.split('|');
-        let (id, url, pass, none) = (parts.next()?, parts.next()?, parts.next()?, parts.next());
-        if none.is_some() || id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let (id, password, relay_url, pass) = if legacy {
+            // rrpc1: id|relay|pass
+            let mut p = raw.split('|');
+            let (id, url, pass, extra) = (p.next()?, p.next()?, p.next()?, p.next());
+            if extra.is_some() {
+                return None;
+            }
+            (id, "", url, pass)
+        } else {
+            let mut p = raw.split('\n');
+            let (id, pw, url, pass, extra) = (p.next()?, p.next()?, p.next()?, p.next()?, p.next());
+            if extra.is_some() {
+                return None;
+            }
+            (id, pw, url, pass)
+        };
+        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        if url.is_empty() || pass.is_empty() {
+        // A relay URL and its pass go together.
+        if relay_url.is_empty() != pass.is_empty() {
             return None;
         }
-        Some(Self { pairing_id: id.to_ascii_lowercase(), relay_url: url.to_string(), pass: pass.to_string() })
+        Some(Self {
+            pairing_id: id.to_ascii_lowercase(),
+            password: password.to_string(),
+            relay_url: relay_url.to_string(),
+            pass: pass.to_string(),
+        })
     }
 }
 
-pub fn looks_like_join_code(s: &str) -> bool {
-    s.trim().starts_with(JOIN_PREFIX)
+/// True if `s` looks like an invite (current or older format).
+pub fn looks_like_invite(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with(INVITE_PREFIX) || t.starts_with(JOIN_PREFIX)
 }
 
 #[cfg(test)]
@@ -587,22 +627,62 @@ mod tests {
         assert!(parse_license("RRPC-OWNER-UUUU-UUUU-UUUU-UUUU").is_err()); // U is not in the alphabet
     }
 
-    #[test]
-    fn join_code_round_trip() {
-        let jc = JoinCode {
+    fn standard_invite() -> Invite {
+        Invite {
             pairing_id: "ab".repeat(32),
-            relay_url: "https://relay.example.onrender.com".into(),
-            pass: mint_pass(&coupon(), NOW + 3600),
-        };
-        let s = jc.encode();
-        assert!(s.starts_with("rrpc1."));
-        assert_eq!(JoinCode::decode(&format!("  {s}\n")), Some(jc));
+            password: "pw-with|odd chars & 'quotes'".into(),
+            relay_url: String::new(),
+            pass: String::new(),
+        }
     }
 
     #[test]
-    fn join_code_rejects_junk() {
-        assert!(JoinCode::decode("nope").is_none());
-        assert!(JoinCode::decode("rrpc1.!!!").is_none());
-        assert!(JoinCode::decode(&format!("rrpc1.{}", BASE64URL_NOPAD.encode(b"a|b|c"))).is_none());
+    fn standard_invite_round_trip() {
+        let inv = standard_invite();
+        let s = inv.encode();
+        assert!(s.starts_with("rrpc2."));
+        assert!(!inv.has_relay());
+        assert_eq!(Invite::decode(&format!("  {s}\n")), Some(inv));
+    }
+
+    #[test]
+    fn premium_invite_round_trip() {
+        let inv = Invite {
+            relay_url: "https://relay.example.onrender.com".into(),
+            pass: mint_pass(&coupon(), NOW + 3600),
+            ..standard_invite()
+        };
+        assert!(inv.has_relay());
+        assert_eq!(Invite::decode(&inv.encode()), Some(inv));
+    }
+
+    #[test]
+    fn empty_password_is_allowed() {
+        let inv = Invite { password: String::new(), ..standard_invite() };
+        assert_eq!(Invite::decode(&inv.encode()), Some(inv));
+    }
+
+    #[test]
+    fn older_rrpc1_invites_still_decode() {
+        let raw = format!("{}|https://relay.example|somepass", "ab".repeat(32));
+        let s = format!("rrpc1.{}", BASE64URL_NOPAD.encode(raw.as_bytes()));
+        let inv = Invite::decode(&s).unwrap();
+        assert_eq!(inv.password, "");
+        assert_eq!(inv.relay_url, "https://relay.example");
+        assert_eq!(inv.pass, "somepass");
+        assert!(looks_like_invite(&s));
+    }
+
+    #[test]
+    fn invite_rejects_junk() {
+        assert!(Invite::decode("nope").is_none());
+        assert!(Invite::decode("rrpc2.!!!").is_none());
+        let enc = |raw: &str| format!("rrpc2.{}", BASE64URL_NOPAD.encode(raw.as_bytes()));
+        assert!(Invite::decode(&enc("a\nb\nc\nd")).is_none()); // id is not 64 hex chars
+        let id = "ab".repeat(32);
+        assert!(Invite::decode(&enc(&format!("{id}\npw\nhttps://relay\n"))).is_none()); // relay without a pass
+        assert!(Invite::decode(&enc(&format!("{id}\npw\n\npass"))).is_none()); // pass without a relay
+        assert!(Invite::decode(&enc(&format!("{id}\npw\n\n\nextra"))).is_none()); // too many fields
+        assert!(!looks_like_invite("b6a1fada41"));
     }
 }
