@@ -1,5 +1,21 @@
 # Rust Remote Desktop (Personal Edition)
 
+**ওয়েবসাইট:** https://rust-remote-pc-landing.vercel.app
+
+| Windows | Android |
+|---|---|
+| <img src="landing/public/shots/windows-share.png" width="480" alt="Windows app"> | <img src="landing/public/shots/android-connect.png" width="180" alt="Android app"> |
+
+## ডাউনলোড
+
+[সর্বশেষ রিলিজ (v1.0.0)](https://github.com/Tushar8640/rust-remote-pc/releases/latest):
+
+- **Windows:** [rust-remote-pc.exe](https://github.com/Tushar8640/rust-remote-pc/releases/latest/download/rust-remote-pc.exe)। exe সাইন করা নয়, তাই Windows SmartScreen সতর্কতা দেখাতে পারে।
+- **Android:** [RustRemotePC.apk](https://github.com/Tushar8640/rust-remote-pc/releases/latest/download/RustRemotePC.apk)। ইনস্টলের জন্য ব্রাউজার থেকে অ্যাপ ইনস্টলের অনুমতি দিতে হবে।
+
+ল্যান্ডিং পেজের সোর্স `landing/` ফোল্ডারে (Next.js, Tailwind, GSAP, Framer Motion, Vercel এ ডিপ্লয়ড)।
+
+
 একটি হালকা (Lightweight), হাই-পারফরম্যান্স এবং লো-ল্যাটেন্সি রিমোট ডেস্কটপ অ্যাপ্লিকেশন যা Tailscale (P2P Virtual LAN) নেটওয়ার্কের মাধ্যমে অফিসের Windows পিসি থেকে বাসার Windows পিসি রিমোটলি কন্ট্রোল করার জন্য ডিজাইন করা হয়েছে।
 
 ---
