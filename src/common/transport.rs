@@ -97,7 +97,7 @@ pub fn quic_config() -> iroh::endpoint::QuicTransportConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::common::protocol::QualityMode;
-use premium_auth::{looks_like_join_code, mint_pass, parse_license, JoinCode};
+use premium_auth::{looks_like_join_code, mint_pass, parse_license, JoinCode, Kind, Status};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Premium relay URL compiled into this build (set `RRPC_PREMIUM_RELAY_URL` when building).
@@ -177,14 +177,23 @@ pub async fn test_premium_relay(p: &PremiumRelay) -> Result<String, String> {
     }
 }
 
+/// Where the "Subscribe" button points, set at build time (`RRPC_PURCHASE_URL`).
+pub const DEFAULT_PURCHASE_URL: &str = match option_env!("RRPC_PURCHASE_URL") {
+    Some(u) => u,
+    None => "",
+};
+
 /// Settings kept between runs: `%APPDATA%\rust-remote-pc\settings.txt` (`key=value` lines).
-/// The licence key is stored here in plain text; the file is user-private on Windows.
+/// The activation code is stored here in plain text; the file is user-private on Windows.
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// Host uses the premium relay instead of the free public relays.
     pub premium_enabled: bool,
     pub premium_url: String,
+    /// The licence key (subscription) or coupon code that unlocks Premium.
     pub premium_license: String,
+    /// Where customers buy or renew a subscription.
+    pub purchase_url: String,
     /// Quality mode this PC offers to viewers by default.
     pub host_quality: QualityMode,
     /// Quality mode requested when connecting to a PC.
@@ -197,15 +206,118 @@ impl Default for Settings {
             premium_enabled: false,
             premium_url: DEFAULT_PREMIUM_URL.to_string(),
             premium_license: String::new(),
+            purchase_url: DEFAULT_PURCHASE_URL.to_string(),
             host_quality: QualityMode::Auto,
             client_quality: QualityMode::Auto,
         }
     }
 }
 
+/// Whether the entered activation code unlocks Premium right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// Nothing entered.
+    NotSet,
+    /// Entered but not a valid code.
+    Invalid(String),
+    /// A subscription that has ended.
+    Expired { expired_at: u64 },
+    /// Unlocked. `expires_at` is 0 when it never expires.
+    Active { kind: Kind, id: String, expires_at: u64 },
+}
+
+impl Activation {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    /// A short line for the UI and logs.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NotSet => "Not activated".to_string(),
+            Self::Invalid(e) => format!("Not valid: {e}"),
+            Self::Expired { expired_at } => format!("Subscription expired on {}", format_date(*expired_at)),
+            Self::Active { kind: Kind::Coupon, id, .. } => format!("Active: coupon ({id})"),
+            Self::Active { id, expires_at: 0, .. } => format!("Active: licence {id}, no end date"),
+            Self::Active { id, expires_at, .. } => {
+                format!("Active: licence {id}, renews or ends {}", format_date(*expires_at))
+            }
+        }
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) for a Unix time.
+pub fn format_date(unix: u64) -> String {
+    // Days-to-civil conversion (Howard Hinnant's algorithm).
+    let z = (unix / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Opens an `https://` link in the default browser. Anything else is ignored.
+pub fn open_link(url: &str) -> bool {
+    let url = url.trim();
+    if !url.starts_with("https://") || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // rundll32 takes the URL as a plain argument; no shell parses it.
+        return std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+            .is_ok();
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener).arg(url).spawn().is_ok()
+    }
+}
+
 impl Settings {
+    /// True if a relay URL and an activation code have both been entered.
     pub fn premium_configured(&self) -> bool {
         !self.premium_url.trim().is_empty() && !self.premium_license.trim().is_empty()
+    }
+
+    /// Checks the activation code (licence key or coupon) against the clock.
+    pub fn activation(&self) -> Activation {
+        let code = self.premium_license.trim();
+        if code.is_empty() {
+            return Activation::NotSet;
+        }
+        match parse_license(code) {
+            Err(e) => Activation::Invalid(e.to_string()),
+            Ok(l) => match l.status(unix_now()) {
+                Status::Expired { expired_at } => Activation::Expired { expired_at },
+                Status::Active { expires_at } => Activation::Active { kind: l.kind, id: l.id, expires_at },
+            },
+        }
+    }
+
+    /// Why Premium cannot be turned on yet, as a message for the user; `None` if it can.
+    pub fn premium_blocker(&self) -> Option<String> {
+        match self.activation() {
+            Activation::Active { .. } => None,
+            Activation::NotSet => Some(
+                "Premium is a paid feature. Subscribe to get a licence, or enter a coupon code or licence key."
+                    .to_string(),
+            ),
+            Activation::Invalid(e) => Some(format!("The activation code is not valid ({e}).")),
+            Activation::Expired { expired_at } => Some(format!(
+                "Your subscription ended on {}. Renew it to keep using Premium.",
+                format_date(expired_at)
+            )),
+        }
     }
 
     /// The host's relay (URL plus a freshly minted pass), if premium is on.
@@ -214,12 +326,14 @@ impl Settings {
         if !self.premium_enabled {
             return Ok(None);
         }
+        if let Some(why) = self.premium_blocker() {
+            return Err(why);
+        }
         let url = self.premium_url.trim();
         if url.is_empty() {
             return Err("Premium is on but no relay URL is set.".to_string());
         }
-        let license = parse_license(&self.premium_license)
-            .map_err(|e| format!("Premium licence key is not valid: {e}."))?;
+        let license = parse_license(&self.premium_license).map_err(|e| format!("Activation code is not valid: {e}."))?;
         let relay = PremiumRelay {
             url: url.to_string(),
             key: mint_pass(&license, unix_now() + HOST_PASS_TTL),
@@ -228,13 +342,14 @@ impl Settings {
         Ok(Some(relay))
     }
 
-    /// The join code to share for a host with Pairing ID `pairing_id`, if premium is on.
+    /// The join code to share for a host with Pairing ID `pairing_id`, if premium is on
+    /// and unlocked.
     ///
     /// It carries a pass valid for about a day, so a code that leaks stops working
     /// on its own. The expiry is rounded to the hour so the code stays stable while
     /// it is on screen.
     pub fn join_code(&self, pairing_id: &str) -> Option<String> {
-        if !self.premium_enabled {
+        if !self.premium_enabled || !self.activation().is_active() {
             return None;
         }
         let license = parse_license(&self.premium_license).ok()?;
@@ -296,6 +411,7 @@ pub fn load_settings() -> Settings {
                 "premium_enabled" => s.premium_enabled = parse_bool(v),
                 "premium_url" if !v.is_empty() => s.premium_url = v.to_string(),
                 "premium_license" => s.premium_license = v.to_string(),
+                "purchase_url" if !v.is_empty() => s.purchase_url = v.to_string(),
                 "host_quality" => s.host_quality = QualityMode::parse(v).unwrap_or_default(),
                 "client_quality" => s.client_quality = QualityMode::parse(v).unwrap_or_default(),
                 _ => {}
@@ -320,10 +436,11 @@ pub fn save_settings(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let text = format!(
-        "premium_enabled={}\npremium_url={}\npremium_license={}\nhost_quality={}\nclient_quality={}\n",
+        "premium_enabled={}\npremium_url={}\npremium_license={}\npurchase_url={}\nhost_quality={}\nclient_quality={}\n",
         s.premium_enabled,
         s.premium_url.trim(),
         s.premium_license.trim(),
+        s.purchase_url.trim(),
         quality_key(s.host_quality),
         quality_key(s.client_quality),
     );
@@ -338,5 +455,66 @@ fn quality_key(m: QualityMode) -> &'static str {
         QualityMode::Smooth => "smooth",
         QualityMode::Sharp => "sharp",
         QualityMode::DataSaver => "saver",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_format_correctly() {
+        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(951_782_400), "2000-02-29"); // leap day
+        assert_eq!(format_date(1_700_000_000), "2023-11-14");
+        assert_eq!(format_date(1_795_046_400), "2026-11-19");
+        assert_eq!(format_date(1_795_046_399), "2026-11-18");
+    }
+
+    #[test]
+    fn premium_is_gated_by_activation() {
+        let mut s = Settings { premium_enabled: true, premium_url: "https://relay.example".into(), ..Settings::default() };
+        // Nothing entered: blocked, and no relay or join code is produced.
+        assert_eq!(s.activation(), Activation::NotSet);
+        assert!(s.premium_blocker().is_some());
+        assert!(s.host_relay().is_err());
+        assert!(s.join_code(&"ab".repeat(32)).is_none());
+        // Garbage: blocked.
+        s.premium_license = "not-a-code".into();
+        assert!(matches!(s.activation(), Activation::Invalid(_)));
+        assert!(s.host_relay().is_err());
+        // Premium off: no relay needed, no error.
+        s.premium_enabled = false;
+        assert_eq!(s.host_relay(), Ok(None));
+    }
+
+    #[test]
+    fn coupon_and_licence_unlock_premium() {
+        let secret = "unit-test-secret-0123456789";
+        let mut s = Settings { premium_enabled: true, premium_url: "https://relay.example".into(), ..Settings::default() };
+
+        s.premium_license = premium_auth::issue_coupon(secret, "owner").unwrap();
+        assert!(s.activation().is_active());
+        assert!(s.host_relay().unwrap().is_some());
+        let code = s.join_code(&"ab".repeat(32)).unwrap();
+        assert!(JoinCode::decode(&code).is_some());
+
+        s.premium_license = premium_auth::issue_license(secret, "acme", unix_now() + 86_400).unwrap();
+        assert!(s.activation().is_active());
+
+        // An ended subscription is blocked, with a renewal message.
+        s.premium_license = premium_auth::issue_license(secret, "acme", unix_now() - 10).unwrap();
+        assert!(matches!(s.activation(), Activation::Expired { .. }));
+        assert!(s.premium_blocker().unwrap().contains("Renew"));
+        assert!(s.host_relay().is_err());
+        assert!(s.join_code(&"ab".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn only_https_links_open() {
+        assert!(!open_link("http://example.com"));
+        assert!(!open_link("javascript:alert(1)"));
+        assert!(!open_link("https://exa mple.com"));
+        assert!(!open_link(""));
     }
 }

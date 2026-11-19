@@ -128,3 +128,11 @@ cd android-client; .\gradlew.bat assembleRelease
 - হোস্ট সেটআপ: Desktop এ **Premium relay** পেজে URL ও licence key দিয়ে "Test connection"।
 - লাইসেন্স ইস্যু: `premium-relay.exe issue <customer-id>` (`RELAY_SECRET` সহ)।
 - হেডলেস: `RRPC_PREMIUM=1`, `RRPC_PREMIUM_URL`, `RRPC_PREMIUM_LICENSE` সেট করে `host`; `rust-remote-pc join-code` নতুন কোড ছাপে।
+
+### Premium কিভাবে পাওয়া যায় (coupon / subscription)
+
+Premium চালু করতে অ্যাক্টিভেশন কোড লাগে; কোড ছাড়া "Premium" বেছে নেওয়া যায় না এবং **Subscribe** বাটন দেখায়। সার্ভারই কোড যাচাই করে, তাই অ্যাপ বদলে এটা এড়ানো যায় না।
+
+- **Coupon** (শুধু মালিকের জন্য, ফ্রি, মেয়াদ নেই): `premium-relay.exe coupon owner`
+- **Licence key** (গ্রাহকের সাবস্ক্রিপশন, মেয়াদ আছে): `premium-relay.exe issue <customer-id> --days 30`
+- পেমেন্ট সিস্টেম বিল্ট-ইন নেই। Subscribe বাটন `RRPC_PURCHASE_URL` (বিল্ড টাইমে) বা `settings.txt` এর `purchase_url` এ থাকা পেজ খোলে; গ্রাহক পেমেন্ট করলে আপনি `issue` চালিয়ে কী পাঠান। বিস্তারিত: [`relay-server/README.md`](relay-server/README.md)।

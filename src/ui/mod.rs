@@ -68,6 +68,8 @@ pub struct UnifiedRemoteApp {
     // Saved settings and premium relay
     settings: transport::Settings,
     show_relay_key: bool,
+    /// Set when the user tried to turn on Premium without an active subscription or coupon.
+    premium_gate: bool,
     relay_test: Option<oneshot::Receiver<Result<String, String>>>,
     relay_test_result: Option<(bool, String)>,
 
@@ -143,6 +145,7 @@ impl UnifiedRemoteApp {
             client_mode: settings.client_quality,
             settings,
             show_relay_key: false,
+            premium_gate: false,
             relay_test: None,
             relay_test_result: None,
 
@@ -170,6 +173,16 @@ impl UnifiedRemoteApp {
 
             toast: None,
             rt: tokio_runtime,
+        }
+    }
+
+    /// Opens the page where a subscription is bought or renewed.
+    fn open_purchase_page(&mut self) {
+        let url = self.settings.purchase_url.trim().to_string();
+        if url.is_empty() {
+            self.toast("No subscription page is set up yet. Ask your provider for a licence.");
+        } else if !transport::open_link(&url) {
+            self.toast("Could not open the subscription page.");
         }
     }
 
@@ -219,10 +232,6 @@ impl UnifiedRemoteApp {
         };
         if self.host_password.is_empty() {
             self.toast("Set a password first");
-            return;
-        }
-        if self.settings.premium_enabled && !self.settings.premium_configured() {
-            self.toast("Set up Premium first (relay URL and licence key)");
             return;
         }
         let premium_relay = match self.settings.host_relay() {
@@ -612,6 +621,7 @@ impl UnifiedRemoteApp {
 
         // ── Connection mode: standard (free public relays) or premium (your relay) ──
         let mut open_premium_page = false;
+        let mut open_purchase = false;
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -629,7 +639,14 @@ impl UnifiedRemoteApp {
                     &[(false, "Standard"), (true, "Premium")],
                 );
                 if self.settings.premium_enabled != before {
-                    self.save_settings();
+                    if self.settings.premium_enabled && self.settings.premium_blocker().is_some() {
+                        // Premium needs a subscription or a coupon: stay on Standard and say why.
+                        self.settings.premium_enabled = false;
+                        self.premium_gate = true;
+                    } else {
+                        self.premium_gate = false;
+                        self.save_settings();
+                    }
                 }
             });
             ui.add_space(6.0f32);
@@ -640,24 +657,31 @@ impl UnifiedRemoteApp {
             };
             ui.label(RichText::new(note).size(11.5f32).color(C.text_faint));
 
-            if self.settings.premium_enabled && !self.settings.premium_configured() {
+            // Premium is locked until there is an active subscription or a coupon. Shown when
+            // the user tried to switch it on, or when it was on and the subscription has ended.
+            let blocker = self.settings.premium_blocker();
+            if blocker.is_some() && (self.premium_gate || self.settings.premium_enabled) {
                 ui.add_space(10.0f32);
                 theme::banner(C.amber).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("Premium is on but not set up. Add the relay URL and licence key first.")
-                            .size(12.0f32)
-                            .color(C.amber),
-                    );
+                    ui.label(RichText::new(blocker.unwrap_or_default()).size(12.0f32).color(C.amber));
                 });
                 ui.add_space(6.0f32);
-                if theme::button_sized(ui, "Set up premium", BtnKind::Ghost, 0.0f32, 28.0f32, 12.0f32).clicked() {
-                    open_premium_page = true;
-                }
+                ui.horizontal(|ui| {
+                    if theme::button_sized(ui, "Subscribe", BtnKind::Primary, 100.0f32, 28.0f32, 12.0f32).clicked() {
+                        open_purchase = true;
+                    }
+                    if theme::button_sized(ui, "Enter coupon or licence", BtnKind::Ghost, 0.0f32, 28.0f32, 12.0f32).clicked() {
+                        open_premium_page = true;
+                    }
+                });
             }
         });
         if open_premium_page {
             self.tab = Tab::Premium;
+        }
+        if open_purchase {
+            self.open_purchase_page();
         }
         ui.add_space(14.0f32);
 
@@ -1061,6 +1085,7 @@ impl UnifiedRemoteApp {
         let mut changed = false;
         let mut run_test = false;
         let mut clear = false;
+        let mut subscribe = false;
 
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1080,13 +1105,13 @@ impl UnifiedRemoteApp {
             .changed();
 
             ui.add_space(6.0f32);
-            field_label(ui, "Licence key");
+            field_label(ui, "Coupon or licence code");
             ui.horizontal(|ui| {
                 let w = ui.available_width() - 76.0f32;
                 changed |= theme::text_field(
                     ui,
                     &mut self.settings.premium_license,
-                    "rrpc-lic1.…",
+                    "RRPC-… coupon or rrpc-lic2.… licence",
                     w.max(120.0f32),
                     !self.show_relay_key,
                     false,
@@ -1098,9 +1123,19 @@ impl UnifiedRemoteApp {
                 }
             });
 
+            // Status of the code that was entered
+            ui.add_space(8.0f32);
+            let activation = self.settings.activation();
+            let status_color = match &activation {
+                transport::Activation::Active { .. } => C.green,
+                transport::Activation::NotSet => C.text_dim,
+                _ => C.amber,
+            };
+            ui.label(RichText::new(activation.describe()).size(12.5f32).color(status_color));
+
             ui.add_space(12.0f32);
             ui.horizontal(|ui| {
-                let configured = self.settings.premium_configured();
+                let configured = self.settings.premium_configured() && activation.is_active();
                 ui.add_enabled_ui(configured && self.relay_test.is_none(), |ui| {
                     if theme::button(ui, "Test connection", BtnKind::Primary, 140.0f32).clicked() {
                         run_test = true;
@@ -1114,6 +1149,9 @@ impl UnifiedRemoteApp {
                         }
                     },
                 );
+                if theme::button(ui, "Subscribe / renew", BtnKind::Ghost, 140.0f32).clicked() {
+                    subscribe = true;
+                }
                 if self.relay_test.is_some() {
                     ui.spinner();
                     ui.label(RichText::new("Testing…").size(12.5f32).color(C.accent_hover));
@@ -1136,12 +1174,14 @@ impl UnifiedRemoteApp {
             theme::section_label(ui, "How it works");
             ui.add_space(6.0f32);
             for line in [
-                "1. Enter the relay URL and the licence key you were given, then press Test connection.",
+                "Premium is a paid feature. Subscribe to get a licence key, or enter a coupon code if you were given one.",
+                "1. Enter the relay URL and your coupon or licence code, then press Test connection.",
                 "2. On Share this PC, set Connection to Premium and start sharing.",
                 "3. Copy the join code and send it, with the password, to whoever should connect.",
                 "4. They paste the join code on the Connect page (or in the Android app). They need no licence or settings.",
-                "The licence key stays on this PC. Join codes carry a short-lived pass instead, so a leaked code stops working on its own.",
-                "The licence key is stored on this PC in plain text.",
+                "The code stays on this PC. Join codes carry a short-lived pass instead, so a leaked join code stops working on its own.",
+                "A subscription licence stops working when it ends; renew it to keep Premium. Coupons do not expire.",
+                "The code is stored on this PC in plain text.",
             ] {
                 ui.label(RichText::new(line).size(12.0f32).color(C.text_dim));
                 ui.add_space(3.0f32);
@@ -1150,7 +1190,11 @@ impl UnifiedRemoteApp {
 
         if changed {
             self.relay_test_result = None;
+            self.premium_gate = false;
             self.save_settings();
+        }
+        if subscribe {
+            self.open_purchase_page();
         }
         if clear {
             self.settings.premium_license.clear();

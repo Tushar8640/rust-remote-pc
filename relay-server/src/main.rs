@@ -6,7 +6,9 @@
 //!
 //! Commands:
 //!   premium-relay                 run the relay (default)
-//!   premium-relay issue <id>      print a licence key for customer <id>
+//!   premium-relay issue <id> [--days N]   print a licence key for customer <id> (a subscription
+//!                                 that ends after N days; without --days it never expires)
+//!   premium-relay coupon <id>     print a free coupon code (for the owner; never expires)
 //!   premium-relay check <pass>    verify a pass (for troubleshooting)
 //!
 //! Environment:
@@ -19,7 +21,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use iroh_relay::server::{
     Access, AccessControl, ClientRateLimit, ClientRequest, RelayConfig, Server, ServerConfig,
 };
-use premium_auth::{issue_license, verify_pass};
+use premium_auth::{issue_coupon, issue_license, verify_pass};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -144,9 +146,34 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         None | Some("serve") => serve().await,
         Some("issue") => {
-            let id = args.get(1).ok_or_else(|| anyhow!("usage: premium-relay issue <customer-id>"))?;
-            let key = issue_license(&secret_from_env()?, id).map_err(|e| anyhow!("{e}"))?;
+            let usage = "usage: premium-relay issue <customer-id> [--days N]";
+            let id = args.get(1).ok_or_else(|| anyhow!(usage))?;
+            let expires_at = match args.get(2).map(String::as_str) {
+                None => 0,
+                Some("--days") => {
+                    let days: u64 = args
+                        .get(3)
+                        .ok_or_else(|| anyhow!(usage))?
+                        .parse()
+                        .context("--days must be a whole number")?;
+                    if days == 0 {
+                        bail!("--days must be at least 1 (omit it for a licence that never expires)");
+                    }
+                    now_secs() + days * 86_400
+                }
+                Some(_) => bail!(usage),
+            };
+            let key = issue_license(&secret_from_env()?, id, expires_at).map_err(|e| anyhow!("{e}"))?;
             println!("{key}");
+            if expires_at != 0 {
+                eprintln!("valid until unix time {expires_at}");
+            }
+            Ok(())
+        }
+        Some("coupon") => {
+            let id = args.get(1).ok_or_else(|| anyhow!("usage: premium-relay coupon <id>"))?;
+            let code = issue_coupon(&secret_from_env()?, id).map_err(|e| anyhow!("{e}"))?;
+            println!("{code}");
             Ok(())
         }
         Some("check") => {
@@ -160,6 +187,6 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(other) => bail!("unknown command '{other}' (use: serve, issue <id>, check <pass>)"),
+        Some(other) => bail!("unknown command '{other}' (use: serve, issue <id> [--days N], coupon <id>, check <pass>)"),
     }
 }

@@ -229,7 +229,11 @@ fn main() -> Result<(), anyhow::Error> {
             let key = common::transport::load_or_create_secret_key();
             match settings.join_code(&common::transport::pairing_id(&key)) {
                 Some(code) => println!("{code}"),
-                None => anyhow::bail!("The premium licence key is not valid."),
+                None => anyhow::bail!(
+                    settings
+                        .premium_blocker()
+                        .unwrap_or_else(|| "Premium is not available.".to_string())
+                ),
             }
         }
         Some(Commands::Client { host, password }) => {
