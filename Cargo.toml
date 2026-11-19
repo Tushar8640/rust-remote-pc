@@ -47,7 +47,16 @@ hex = "0.4"
 # Optional H264 feature for openh264
 openh264 = { version = "0.6", optional = true }
 cpal = "0.18.2"
+iroh = "1.4.2"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
+premium-auth = { path = "premium-auth" }
 
 [features]
 default = []
 h264 = ["dep:openh264"]
+
+[workspace]
+members = ["android-bridge", "premium-auth", "relay-server"]
+
+[profile.release]
+strip = true

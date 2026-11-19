@@ -91,6 +91,9 @@ object ProtocolCodec {
                 out.write((packet.channels shr 8) and 0xFF)
                 writeBytes(out, packet.data)
             }
+            is Packet.SetQuality -> {
+                out.write(packet.mode and 0xFF)
+            }
         }
     }
 

@@ -1,0 +1,10 @@
+[package]
+name = "premium-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Licence keys, relay passes and join codes for the premium relay"
+
+[dependencies]
+data-encoding = "2.11.1"
+hmac = "0.12"
+sha2 = "0.10"

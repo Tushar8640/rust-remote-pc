@@ -1,0 +1,17 @@
+[package]
+name = "premium-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Premium relay server: iroh relay with licence-pass access control, for Render or any HTTP host"
+
+[[bin]]
+name = "premium-relay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+iroh-relay = { version = "1.4.2", features = ["server"] }
+premium-auth = { version = "0.1.0", path = "../premium-auth" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

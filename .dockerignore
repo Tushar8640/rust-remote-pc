@@ -1,0 +1,7 @@
+target
+android-client
+android-bridge
+setup
+.git
+src
+**/build

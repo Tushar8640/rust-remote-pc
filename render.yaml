@@ -1,0 +1,22 @@
+# Render Blueprint for the premium relay. See relay-server/README.md.
+#
+# The relay speaks HTTP/WebSocket only; Render terminates TLS in front of it.
+# Pick the region before the first deploy: Render does not allow changing it later.
+services:
+  - type: web
+    name: rrpc-premium-relay
+    runtime: docker
+    dockerfilePath: ./relay-server/Dockerfile
+    dockerContext: .
+    region: singapore
+    healthCheckPath: /
+    # No `plan` is set, so Render's default paid web-service plan is used. Do not use
+    # the free plan: it spins down after 15 minutes without traffic.
+    envVars:
+      # Prompted for in the dashboard when the Blueprint is created. It signs licences,
+      # so keep it private and keep a copy: you need it to issue licences.
+      - key: RELAY_SECRET
+        sync: false
+      # Optional variables you can add later in the dashboard (see relay-server/README.md):
+      #   REVOKED_LICENSES  comma-separated licence ids to refuse, e.g. acme,beta-corp
+      #   CLIENT_MAX_KBPS   cap on each client's upload through the relay, in kbit/s

@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,7 +30,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remote.rustpc.data.DEFAULT_PORT
+import com.remote.rustpc.data.QualityMode
 import com.remote.rustpc.network.ConnectionState
+import com.remote.rustpc.network.IrohBridge
 import com.remote.rustpc.ui.theme.*
 
 @Composable
@@ -41,7 +44,8 @@ fun ConnectScreen(
     initialRemember: Boolean,
     recentHosts: List<String>,
     onRemoveRecent: (String) -> Unit,
-    onConnect: (host: String, port: Int, pass: String, rememberPassword: Boolean) -> Unit,
+    initialQuality: QualityMode,
+    onConnect: (host: String, port: Int, pass: String, rememberPassword: Boolean, quality: QualityMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var host by remember { mutableStateOf(initialHost) }
@@ -49,6 +53,7 @@ fun ConnectScreen(
     var password by remember { mutableStateOf(initialPassword) }
     var showPassword by remember { mutableStateOf(false) }
     var rememberPw by remember { mutableStateOf(initialRemember) }
+    var quality by remember { mutableStateOf(initialQuality) }
 
     val focus = LocalFocusManager.current
     val passwordFocus = remember { FocusRequester() }
@@ -56,14 +61,16 @@ fun ConnectScreen(
     val isLoading = connectionState is ConnectionState.Connecting || connectionState is ConnectionState.Authenticating
     val serverError = (connectionState as? ConnectionState.Error)?.message
 
+    val isPairingId = IrohBridge.isPairingId(host)
+    val isJoinCode = IrohBridge.isJoinCode(host)
     val port = portText.toIntOrNull()
-    val portValid = port != null && port in 1..65535
+    val portValid = isPairingId || isJoinCode || (port != null && port in 1..65535)
     val canConnect = !isLoading && host.isNotBlank() && portValid
 
     fun submit() {
         if (!canConnect) return
         focus.clearFocus()
-        onConnect(host.trim(), port ?: DEFAULT_PORT, password, rememberPw)
+        onConnect(host.trim(), port ?: DEFAULT_PORT, password, rememberPw, quality)
     }
 
     Box(
@@ -117,7 +124,7 @@ fun ConnectScreen(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Enter the address and password shown on the host.",
+                    "Enter the join code, Pairing ID or address, and the password shown on the host.",
                     style = Typography.bodyMedium.copy(color = TextSecondary)
                 )
             }
@@ -138,8 +145,8 @@ fun ConnectScreen(
                         AppTextField(
                             value = host,
                             onValueChange = { host = it.trim() },
-                            label = "Address",
-                            placeholder = "100.x.y.z",
+                            label = "Join code, Pairing ID or address",
+                            placeholder = "Paste the join code",
                             leading = Icons.Default.Lan,
                             keyboardType = KeyboardType.Uri,
                             imeAction = ImeAction.Next,
@@ -147,20 +154,29 @@ fun ConnectScreen(
                             mono = true,
                             modifier = Modifier.weight(1f)
                         )
-                        AppTextField(
-                            value = portText,
-                            onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                            label = "Port",
-                            placeholder = "$DEFAULT_PORT",
-                            keyboardType = KeyboardType.Number,
-                            imeAction = ImeAction.Next,
-                            enabled = !isLoading,
-                            mono = true,
-                            isError = portText.isNotEmpty() && !portValid,
-                            modifier = Modifier.width(104.dp)
+                        // Port only matters for LAN/Tailscale addresses.
+                        if (host.isNotBlank() && !isPairingId && !isJoinCode) {
+                            AppTextField(
+                                value = portText,
+                                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
+                                label = "Port",
+                                placeholder = "$DEFAULT_PORT",
+                                keyboardType = KeyboardType.Number,
+                                imeAction = ImeAction.Next,
+                                enabled = !isLoading,
+                                mono = true,
+                                isError = portText.isNotEmpty() && !portValid,
+                                modifier = Modifier.width(104.dp)
+                            )
+                        }
+                    }
+                    if (isPairingId || isJoinCode) {
+                        Text(
+                            if (isJoinCode) "Premium join code detected: connects through the host's premium relay."
+                            else "Pairing ID detected: connects over the internet, no VPN needed.",
+                            style = Typography.labelMedium.copy(color = TextFaint)
                         )
                     }
-
                     AppTextField(
                         value = password,
                         onValueChange = { password = it },
@@ -211,6 +227,8 @@ fun ConnectScreen(
                             )
                         }
                     }
+
+                    QualitySelector(selected = quality, enabled = !isLoading) { quality = it }
 
                     if (serverError != null) {
                         Row(
@@ -298,7 +316,7 @@ fun ConnectScreen(
                             )
                             Spacer(Modifier.width(12.dp))
                             Text(
-                                rHost,
+                                IrohBridge.shorten(rHost),
                                 style = Typography.bodyMedium.copy(
                                     color = TextPrimary,
                                     fontFamily = FontFamily.Monospace
@@ -308,7 +326,7 @@ fun ConnectScreen(
                             IconButton(onClick = { onRemoveRecent(rHost) }) {
                                 Icon(
                                     Icons.Default.Close,
-                                    contentDescription = "Remove $rHost",
+                                    contentDescription = "Remove ${IrohBridge.shorten(rHost)}",
                                     tint = TextFaint,
                                     modifier = Modifier.size(18.dp)
                                 )
@@ -335,11 +353,52 @@ fun ConnectScreen(
                     modifier = Modifier.size(18.dp)
                 )
                 Text(
-                    text = "Start sharing on the PC first. Both devices need to be on the same Wi-Fi or connected through Tailscale.",
+                    text = "Start sharing on the PC first, then paste the join code (premium) or Pairing ID it shows. This works from any network. A LAN or Tailscale address (100.x.y.z) also works.",
                     style = Typography.bodyMedium.copy(color = TextSecondary, fontSize = 12.5.sp)
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun QualitySelector(
+    selected: QualityMode,
+    enabled: Boolean,
+    onSelect: (QualityMode) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Video quality", style = Typography.labelMedium.copy(color = TextSecondary))
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            QualityMode.entries.forEach { m ->
+                ModeChip(m.label, m == selected, enabled) { onSelect(m) }
+            }
+        }
+        Text(selected.hint, style = Typography.labelMedium.copy(color = TextFaint))
+    }
+}
+
+@Composable
+private fun ModeChip(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) AccentIndigo else SurfaceElevated,
+        border = BorderStroke(1.dp, if (selected) AccentIndigoLight else BorderDark),
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+    ) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = Typography.bodyMedium.copy(
+                color = if (selected) TextPrimary else TextSecondary,
+                fontSize = 13.sp
+            )
+        )
     }
 }
 

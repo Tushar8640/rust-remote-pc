@@ -85,3 +85,46 @@ cargo run --release -- client --host 100.101.102.103:5885 --password "mysecret12
 - **ল্যাটেন্সি:** Tailscale P2P ডিরেক্ট রুটে ইনপুট রেসপন্স ৫০ ms এর নিচে থাকে।
 - **রিসোর্স ব্যবহার:** ব্যাকগ্রাউন্ডে Host Agent খুবই কম মেমোরি ও CPU ব্যবহার করে।
 - **সিকিউরিটি:** সম্পূর্ণ ডেটা Tailscale এর WireGuard এনক্রিপশন এবং অ্যাপ্লিকেশন লেভেলে SHA-256 টোকেন ভেরিফিকেশন দ্বারা সুরক্ষিত।
+
+## ইন্টারনেট (P2P) কানেকশন: Pairing ID
+
+Tailscale বা পোর্ট ফরোয়ার্ডিং ছাড়াই যেকোনো নেটওয়ার্ক থেকে কানেক্ট করা যায় (iroh, QUIC, end-to-end encrypted)।
+
+1. হোস্ট পিসিতে অ্যাপ খুলুন। "Pairing ID" (৬৪ অক্ষর) দেখাবে। এটি প্রতি পিসির জন্য স্থির থাকে (`%APPDATA%\rust-remote-pc\host.key` থেকে তৈরি; এই ফাইল কাউকে দেবেন না)।
+2. "Start sharing" চাপুন এবং পাসওয়ার্ড দেখুন।
+3. ক্লায়েন্টে (Desktop বা Android) Pairing ID ও পাসওয়ার্ড দিয়ে Connect করুন।
+
+সরাসরি সংযোগ না হলে iroh এর পাবলিক রিলে সার্ভার ব্যবহার হয় (শুধু এনক্রিপ্টেড ডেটা ফরোয়ার্ড করে; অপেক্ষাকৃত বেশি ল্যাটেন্সি)। পুরনো `IP:পোর্ট` (LAN/Tailscale) পদ্ধতিও আগের মতো কাজ করে।
+
+Headless: `rust-remote-pc host --password <pw>` (Pairing ID টার্মিনালে ছাপা হয়; `--no-p2p` দিলে বন্ধ)। টেস্ট: `rust-remote-pc check -H <Pairing ID> -p <pw>`।
+
+### Android এর native bridge পুনরায় বানানো
+
+```powershell
+cargo install cargo-ndk
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+.\android-bridge\build-android.ps1      # jniLibs/ এ libremote_bridge.so তৈরি করে
+cd android-client; .\gradlew.bat assembleRelease
+```
+
+## ভিডিও কোয়ালিটি মোড
+
+হোস্টের "Quality mode" এবং ভিউয়ারের সেশনের মধ্যেই (Desktop: ওপরের বারে ড্রপডাউন, Android: More → Quality) বদলানো যায়:
+
+| মোড | কাজ |
+|---|---|
+| Auto | ব্যালান্সড; লিংক অনুযায়ী নিজে কোয়ালিটি/রেজোলিউশন ঠিক করে |
+| Smooth | সর্বনিম্ন ডিলে ও বেশি ফ্রেম রেট (কোয়ালিটি আগে কমে) |
+| Sharp | সবচেয়ে পরিষ্কার ছবি (ধীর লিংকে ফ্রেম রেট কমতে পারে) |
+| Data saver | অর্ধেক রেজোলিউশন, মোবাইল ডেটার জন্য |
+
+হেডলেস: `rust-remote-pc host --quality-mode sharp`। ক্লায়েন্ট টেস্ট: `rust-remote-pc check -H <ID> -p <pw> --quality-mode smooth` (শেষে `link: Direct/Relay ... ms` দেখায়)।
+
+## Premium (নিজের রিলে সার্ভার, Render এ ডিপ্লয়)
+
+**হোস্ট** "Share this PC" এ Connection = **Premium** বেছে নিলে অ্যাপ নিজেই আপনার রিলে সার্ভার ব্যবহার করে। হোস্ট একটি **join code** কপি করে পাসওয়ার্ডসহ শেয়ার করে; **ক্লায়েন্ট** (Desktop বা Android) শুধু সেই কোড পেস্ট করে জয়েন করে, কোনো সেটিং বা লাইসেন্স লাগে না।
+
+- সার্ভার ডিপ্লয় (Render), লাইসেন্স ইস্যু, রিভোক: [`relay-server/README.md`](relay-server/README.md) এবং রুটের `render.yaml`।
+- হোস্ট সেটআপ: Desktop এ **Premium relay** পেজে URL ও licence key দিয়ে "Test connection"।
+- লাইসেন্স ইস্যু: `premium-relay.exe issue <customer-id>` (`RELAY_SECRET` সহ)।
+- হেডলেস: `RRPC_PREMIUM=1`, `RRPC_PREMIUM_URL`, `RRPC_PREMIUM_LICENSE` সেট করে `host`; `rust-remote-pc join-code` নতুন কোড ছাপে।

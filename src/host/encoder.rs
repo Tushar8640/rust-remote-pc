@@ -1,63 +1,91 @@
 use crate::common::protocol::FrameFormat;
-use anyhow::Result;
-use image::codecs::jpeg::JpegEncoder;
-use image::ColorType;
-use std::io::Cursor;
+use anyhow::{anyhow, Result};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
+/// Encodes captured RGBA frames for the wire.
 pub struct VideoEncoder {
     format: FrameFormat,
+    /// Reused buffer for half-resolution frames.
+    half: Vec<u8>,
+}
+
+/// One encoded frame plus its (possibly reduced) dimensions.
+pub struct EncodedFrame {
+    pub format: FrameFormat,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
 }
 
 impl VideoEncoder {
     pub fn new(format: FrameFormat) -> Self {
-        Self { format }
+        Self { format, half: Vec::new() }
     }
 
-    pub fn encode(&mut self, width: u32, height: u32, rgba_data: &[u8]) -> Result<(FrameFormat, Vec<u8>)> {
+    /// Encodes `rgba_data` (`width` x `height`). With `half_scale` the frame is
+    /// box-filtered to half size first (about 4x fewer pixels), which is how the
+    /// sender backs off on slow links. `quality` overrides the JPEG quality.
+    pub fn encode(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba_data: &[u8],
+        quality: u8,
+        half_scale: bool,
+    ) -> Result<EncodedFrame> {
         match self.format {
-            FrameFormat::Jpeg { quality } => {
-                let mut buffer = Vec::new();
-                let mut cursor = Cursor::new(&mut buffer);
-                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
-
-                // Convert RGBA to RGB for JPEG encoding (JPEG does not support alpha)
-                let rgb_len = (width * height * 3) as usize;
-                let mut rgb = Vec::with_capacity(rgb_len);
-                for chunk in rgba_data.chunks_exact(4) {
-                    rgb.push(chunk[0]); // R
-                    rgb.push(chunk[1]); // G
-                    rgb.push(chunk[2]); // B
+            FrameFormat::RawRgba => Ok(EncodedFrame {
+                format: FrameFormat::RawRgba,
+                width,
+                height,
+                data: rgba_data.to_vec(),
+            }),
+            // H.264 is not implemented; Jpeg and the H264 fallback both use JPEG.
+            _ => {
+                let (w, h, pixels): (usize, usize, &[u8]) = if half_scale && width >= 2 && height >= 2 {
+                    let (nw, nh) = downscale_half(rgba_data, width as usize, height as usize, &mut self.half);
+                    (nw, nh, &self.half)
+                } else {
+                    (width as usize, height as usize, rgba_data)
+                };
+                if w > u16::MAX as usize || h > u16::MAX as usize {
+                    return Err(anyhow!("frame too large for JPEG: {}x{}", w, h));
                 }
 
-                encoder.encode(&rgb, width, height, ColorType::Rgb8.into())?;
-                Ok((FrameFormat::Jpeg { quality }, buffer))
-            }
-            #[cfg(feature = "h264")]
-            FrameFormat::H264 { is_keyframe } => {
-                // Future openh264 stream implementation
-                let mut buffer = Vec::new();
-                Ok((FrameFormat::H264 { is_keyframe }, buffer))
-            }
-            #[cfg(not(feature = "h264"))]
-            FrameFormat::H264 { .. } => {
-                // Fallback to JPEG if h264 feature is not compiled
-                let quality = 75;
-                let mut buffer = Vec::new();
-                let mut cursor = Cursor::new(&mut buffer);
-                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
-
-                let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-                for chunk in rgba_data.chunks_exact(4) {
-                    rgb.push(chunk[0]);
-                    rgb.push(chunk[1]);
-                    rgb.push(chunk[2]);
-                }
-                encoder.encode(&rgb, width, height, ColorType::Rgb8.into())?;
-                Ok((FrameFormat::Jpeg { quality }, buffer))
-            }
-            FrameFormat::RawRgba => {
-                Ok((FrameFormat::RawRgba, rgba_data.to_vec()))
+                let mut buffer = Vec::with_capacity(w * h / 8);
+                let mut encoder = Encoder::new(&mut buffer, quality.clamp(1, 100));
+                // 4:2:0 chroma: roughly a third smaller and faster; the usual choice for screen video.
+                encoder.set_sampling_factor(SamplingFactor::F_2_2);
+                // RGBA is encoded directly (alpha ignored), no intermediate RGB copy.
+                encoder.encode(pixels, w as u16, h as u16, ColorType::Rgba)?;
+                Ok(EncodedFrame {
+                    format: FrameFormat::Jpeg { quality },
+                    width: w as u32,
+                    height: h as u32,
+                    data: buffer,
+                })
             }
         }
     }
+}
+
+/// 2x2 box filter. Returns the new (width, height); output is opaque RGBA in `dst`.
+fn downscale_half(src: &[u8], w: usize, h: usize, dst: &mut Vec<u8>) -> (usize, usize) {
+    let (nw, nh) = (w / 2, h / 2);
+    dst.clear();
+    dst.resize(nw * nh * 4, 255);
+    for y in 0..nh {
+        let r0 = &src[(2 * y) * w * 4..(2 * y) * w * 4 + w * 4];
+        let r1 = &src[(2 * y + 1) * w * 4..(2 * y + 1) * w * 4 + w * 4];
+        let out = &mut dst[y * nw * 4..(y + 1) * nw * 4];
+        for x in 0..nw {
+            let i = x * 8;
+            let o = x * 4;
+            for c in 0..3 {
+                let sum = r0[i + c] as u16 + r0[i + 4 + c] as u16 + r1[i + c] as u16 + r1[i + 4 + c] as u16;
+                out[o + c] = ((sum + 2) >> 2) as u8;
+            }
+        }
+    }
+    (nw, nh)
 }

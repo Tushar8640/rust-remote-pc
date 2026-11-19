@@ -1,7 +1,9 @@
 pub mod theme;
 
-use crate::client::connection::{connect_to_host, ConnectionHandle, DecodedFrameMessage};
+use crate::client::connection::{connect_to_host, ConnectOptions, ConnectionHandle, DecodedFrameMessage};
 use crate::common::net_info::{get_local_ips, InterfaceIp};
+use crate::common::protocol::QualityMode;
+use crate::common::transport;
 use crate::common::protocol::{InputEvent, KeyCode, MouseBtn};
 use crate::host::server::{HostServer, HostServerConfig};
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2};
@@ -22,6 +24,7 @@ const MAX_RECENT: usize = 5;
 enum Tab {
     Host,
     Client,
+    Premium,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -58,6 +61,15 @@ pub struct UnifiedRemoteApp {
     host_started: Option<Instant>,
     host_shutdown: Option<broadcast::Sender<()>>,
     ips: Vec<InterfaceIp>,
+    p2p_key: iroh::SecretKey,
+    p2p_id: String,
+    host_mode: QualityMode,
+
+    // Saved settings and premium relay
+    settings: transport::Settings,
+    show_relay_key: bool,
+    relay_test: Option<oneshot::Receiver<Result<String, String>>>,
+    relay_test_result: Option<(bool, String)>,
 
     // Client
     client_addr: String,
@@ -69,6 +81,7 @@ pub struct UnifiedRemoteApp {
     pending: Option<Pending>,
     recents: Vec<String>,
     focus_addr: bool,
+    client_mode: QualityMode,
 
     // Session
     conn: Option<ConnectionHandle>,
@@ -98,6 +111,8 @@ impl UnifiedRemoteApp {
         theme::apply_theme(&cc.egui_ctx);
 
         let ips = get_local_ips();
+        let p2p_key = transport::load_or_create_secret_key();
+        let settings = transport::load_settings();
         let recents = load_recents();
         let default_addr = if let Some(h) = initial_host {
             h
@@ -122,6 +137,14 @@ impl UnifiedRemoteApp {
             host_started: None,
             host_shutdown: None,
             ips,
+            p2p_id: transport::pairing_id(&p2p_key),
+            p2p_key,
+            host_mode: settings.host_quality,
+            client_mode: settings.client_quality,
+            settings,
+            show_relay_key: false,
+            relay_test: None,
+            relay_test_result: None,
 
             client_addr: default_addr,
             client_password: initial_password.unwrap_or_default(),
@@ -148,6 +171,13 @@ impl UnifiedRemoteApp {
             toast: None,
             rt: tokio_runtime,
         }
+    }
+
+    /// Persists mode choices and the premium relay settings.
+    fn save_settings(&mut self) {
+        self.settings.host_quality = self.host_mode;
+        self.settings.client_quality = self.client_mode;
+        transport::save_settings(&self.settings);
     }
 
     fn toast(&mut self, s: &str) {
@@ -191,12 +221,26 @@ impl UnifiedRemoteApp {
             self.toast("Set a password first");
             return;
         }
+        if self.settings.premium_enabled && !self.settings.premium_configured() {
+            self.toast("Set up Premium first (relay URL and licence key)");
+            return;
+        }
+        let premium_relay = match self.settings.host_relay() {
+            Ok(r) => r,
+            Err(e) => {
+                self.toast(&e);
+                return;
+            }
+        };
         let cfg = HostServerConfig {
             bind_addr: format!("0.0.0.0:{}", port),
             password: self.host_password.clone(),
             target_fps: self.host_fps,
             jpeg_quality: self.host_quality,
             audio_enabled: self.host_audio,
+            p2p_key: Some(self.p2p_key.clone()),
+            quality_mode: self.host_mode,
+            premium_relay,
         };
         let srv = HostServer::new(cfg);
         let (tx, rx) = broadcast::channel(1);
@@ -241,8 +285,12 @@ impl UnifiedRemoteApp {
 
         let (tx_r, rx_r) = oneshot::channel();
         let a = addr.clone();
+        let opts = ConnectOptions {
+            premium: None, // a join code supplies the relay and pass
+            quality: self.client_mode,
+        };
         self.rt.spawn(async move {
-            let r = connect_to_host(&a, &pw, tx_f).await;
+            let r = connect_to_host(&a, &pw, tx_f, opts).await;
             let _ = tx_r.send(r);
         });
         self.pending = Some(Pending { rx: rx_r, addr });
@@ -266,6 +314,10 @@ impl UnifiedRemoteApp {
     }
 
     fn remember(&mut self, addr: &str) {
+        // Join codes expire within a day, so they are not worth saving.
+        if transport::is_join_code(addr) {
+            return;
+        }
         self.recents.retain(|a| a != addr);
         self.recents.insert(0, addr.to_string());
         self.recents.truncate(MAX_RECENT);
@@ -282,7 +334,7 @@ impl eframe::App for UnifiedRemoteApp {
         // Only spin at full rate while streaming; idle screens redraw slowly.
         if self.conn.is_some() {
             ctx.request_repaint();
-        } else if self.host_running || self.connecting {
+        } else if self.host_running || self.connecting || self.relay_test.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -293,6 +345,20 @@ impl eframe::App for UnifiedRemoteApp {
             self.fps = self.fps_count;
             self.fps_count = 0;
             self.fps_tick = Instant::now();
+        }
+
+        // Poll the premium relay connection test (non-blocking)
+        if let Some(mut rx) = self.relay_test.take() {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.relay_test_result = Some(match r {
+                        Ok(m) => (true, m),
+                        Err(e) => (false, e),
+                    });
+                }
+                Err(oneshot::error::TryRecvError::Empty) => self.relay_test = Some(rx),
+                Err(_) => self.relay_test_result = Some((false, "The test did not finish.".to_string())),
+            }
         }
 
         // Poll pending connection (non-blocking)
@@ -403,6 +469,12 @@ impl eframe::App for UnifiedRemoteApp {
                     self.tab = Tab::Client;
                     self.focus_addr = true;
                 }
+                let premium_dot = self.settings.premium_enabled.then_some(C.amber);
+                if theme::nav_item(ui, "Premium relay", self.tab == Tab::Premium, premium_dot, theme::icon_connect)
+                    .clicked()
+                {
+                    self.tab = Tab::Premium;
+                }
 
                 // Network status pinned to the bottom
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -444,6 +516,7 @@ impl eframe::App for UnifiedRemoteApp {
                             match self.tab {
                                 Tab::Host => self.render_host(ui, ctx),
                                 Tab::Client => self.render_client(ui),
+                                Tab::Premium => self.render_premium(ui, ctx),
                             }
                             ui.add_space(40.0f32);
                         });
@@ -534,9 +607,133 @@ impl UnifiedRemoteApp {
         let port = self.host_port.trim().to_string();
         let full_addr = format!("{}:{}", ip, port);
 
+        // ── Pairing ID (works from any network) ──
+        let p2p_id = self.p2p_id.clone();
+
+        // ── Connection mode: standard (free public relays) or premium (your relay) ──
+        let mut open_premium_page = false;
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section_label(ui, "Connect from another device");
+            ui.horizontal(|ui| {
+                theme::section_label(ui, "Connection");
+                if self.host_running {
+                    ui.label(RichText::new("· stop sharing to change").size(11.0f32).color(C.text_faint));
+                }
+            });
+            ui.add_space(8.0f32);
+            ui.add_enabled_ui(!self.host_running, |ui| {
+                let before = self.settings.premium_enabled;
+                theme::segmented(
+                    ui,
+                    &mut self.settings.premium_enabled,
+                    &[(false, "Standard"), (true, "Premium")],
+                );
+                if self.settings.premium_enabled != before {
+                    self.save_settings();
+                }
+            });
+            ui.add_space(6.0f32);
+            let note = if self.settings.premium_enabled {
+                "Your premium relay carries the connection. Share the join code below; clients need nothing else."
+            } else {
+                "Free public relays. Works anywhere, but delay can be higher."
+            };
+            ui.label(RichText::new(note).size(11.5f32).color(C.text_faint));
+
+            if self.settings.premium_enabled && !self.settings.premium_configured() {
+                ui.add_space(10.0f32);
+                theme::banner(C.amber).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Premium is on but not set up. Add the relay URL and licence key first.")
+                            .size(12.0f32)
+                            .color(C.amber),
+                    );
+                });
+                ui.add_space(6.0f32);
+                if theme::button_sized(ui, "Set up premium", BtnKind::Ghost, 0.0f32, 28.0f32, 12.0f32).clicked() {
+                    open_premium_page = true;
+                }
+            }
+        });
+        if open_premium_page {
+            self.tab = Tab::Premium;
+        }
+        ui.add_space(14.0f32);
+
+        // ── What to share ──
+        let join_code = if self.settings.premium_configured() {
+            self.settings.join_code(&p2p_id)
+        } else {
+            None
+        };
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(code) = &join_code {
+                ui.horizontal(|ui| {
+                    theme::section_label(ui, "Join code · premium");
+                    theme::pill(C.amber).show(ui, |ui| {
+                        ui.label(RichText::new("Premium relay · encrypted").size(10.5f32).color(C.amber));
+                    });
+                });
+                ui.add_space(8.0f32);
+                ui.add(
+                    egui::Label::new(RichText::new(transport::display_target(code)).size(15.0f32).monospace().strong()),
+                );
+                ui.add_space(6.0f32);
+                ui.horizontal(|ui| {
+                    if theme::button_sized(ui, "Copy join code", BtnKind::Primary, 130.0f32, 28.0f32, 12.0f32).clicked() {
+                        copy_trigger = Some((code.clone(), "Join code copied"));
+                    }
+                    if theme::button_sized(ui, "Copy ID only", BtnKind::Ghost, 100.0f32, 28.0f32, 12.0f32).clicked() {
+                        copy_trigger = Some((p2p_id.clone(), "Pairing ID copied"));
+                    }
+                });
+                ui.add_space(6.0f32);
+                ui.label(
+                    RichText::new(
+                        "Send the join code and the password. The other device pastes the code and connects through your relay. The code expires after about a day; copy a fresh one when needed.",
+                    )
+                    .size(11.5f32)
+                    .color(C.text_faint),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    theme::section_label(ui, "Pairing ID · connect from anywhere");
+                    theme::pill(C.green).show(ui, |ui| {
+                        ui.label(RichText::new("Internet · encrypted").size(10.5f32).color(C.green));
+                    });
+                });
+                ui.add_space(8.0f32);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&p2p_id).size(12.5f32).monospace().strong())
+                            .wrap(),
+                    );
+                });
+                ui.add_space(6.0f32);
+                ui.horizontal(|ui| {
+                    if theme::button_sized(ui, "Copy ID", BtnKind::Ghost, 84.0f32, 28.0f32, 12.0f32).clicked() {
+                        copy_trigger = Some((p2p_id.clone(), "Pairing ID copied"));
+                    }
+                    ui.label(
+                        RichText::new(if self.host_running {
+                            "Enter this ID and the password on the other device. No VPN or port forwarding needed."
+                        } else {
+                            "Start sharing, then enter this ID and the password on the other device."
+                        })
+                        .size(11.5f32)
+                        .color(C.text_faint),
+                    );
+                });
+            }
+        });
+
+        ui.add_space(14.0f32);
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_label(ui, "Same network or Tailscale");
             ui.add_space(8.0f32);
 
             ui.horizontal(|ui| {
@@ -584,7 +781,7 @@ impl UnifiedRemoteApp {
                 theme::banner(C.amber).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        RichText::new("Tailscale was not detected. This address only works on your local network.")
+                        RichText::new("Tailscale was not detected. This address only works on your local network. Use the Pairing ID above to connect from anywhere.")
                             .size(12.0f32)
                             .color(C.amber),
                     );
@@ -645,6 +842,23 @@ impl UnifiedRemoteApp {
                         field_label(ui, "Share audio");
                         theme::segmented(ui, &mut self.host_audio, &[(true, "On"), (false, "Off")]);
                         ui.end_row();
+
+                        field_label(ui, "Quality mode");
+                        let before = self.host_mode;
+                        theme::segmented(
+                            ui,
+                            &mut self.host_mode,
+                            &[
+                                (QualityMode::Auto, "Auto"),
+                                (QualityMode::Smooth, "Smooth"),
+                                (QualityMode::Sharp, "Sharp"),
+                                (QualityMode::DataSaver, "Saver"),
+                            ],
+                        );
+                        if self.host_mode != before {
+                            self.save_settings();
+                        }
+                        ui.end_row();
                     });
             });
         });
@@ -685,7 +899,7 @@ impl UnifiedRemoteApp {
         page_header(
             ui,
             "Connect to a PC",
-            "Enter the address and password shown on the host.",
+            "Paste the join code or Pairing ID (or an address) and the password shown on the host.",
         );
 
         let mut submit = false;
@@ -693,9 +907,9 @@ impl UnifiedRemoteApp {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_enabled_ui(!self.connecting, |ui| {
-                field_label(ui, "Address");
+                field_label(ui, "Join code, Pairing ID or address");
                 let w = ui.available_width();
-                let r = theme::text_field(ui, &mut self.client_addr, "100.x.y.z:5885", w, false, true);
+                let r = theme::text_field(ui, &mut self.client_addr, "Paste a join code or Pairing ID", w, false, true);
                 if self.focus_addr {
                     r.request_focus();
                     self.focus_addr = false;
@@ -739,7 +953,11 @@ impl UnifiedRemoteApp {
             if self.connecting {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    let addr = self.pending.as_ref().map(|p| p.addr.as_str()).unwrap_or("host");
+                    let addr = self
+                        .pending
+                        .as_ref()
+                        .map(|p| transport::display_target(&p.addr))
+                        .unwrap_or_else(|| "host".to_string());
                     ui.label(
                         RichText::new(format!("Connecting to {}…", addr))
                             .size(12.5f32)
@@ -790,7 +1008,7 @@ impl UnifiedRemoteApp {
                 ui.painter().text(
                     egui::pos2(rect.left() + 44.0f32, rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    addr,
+                    transport::display_target(addr),
                     egui::FontId::monospace(13.0f32),
                     C.text,
                 );
@@ -824,6 +1042,139 @@ impl UnifiedRemoteApp {
             }
             ui.add_space(4.0f32);
             ui.label(RichText::new("Right-click an entry to remove it.").size(11.0f32).color(C.text_faint));
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Premium page (host setup)
+// ═════════════════════════════════════════════════════════════════════════════
+
+impl UnifiedRemoteApp {
+    fn render_premium(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        page_header(
+            ui,
+            "Premium relay",
+            "Run this PC's connections through your own relay server for lower delay and steadier quality.",
+        );
+
+        let mut changed = false;
+        let mut run_test = false;
+        let mut clear = false;
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_label(ui, "Set up this PC as a premium host");
+            ui.add_space(8.0f32);
+
+            field_label(ui, "Relay URL");
+            let w = ui.available_width();
+            changed |= theme::text_field(
+                ui,
+                &mut self.settings.premium_url,
+                "https://your-relay.onrender.com",
+                w,
+                false,
+                true,
+            )
+            .changed();
+
+            ui.add_space(6.0f32);
+            field_label(ui, "Licence key");
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 76.0f32;
+                changed |= theme::text_field(
+                    ui,
+                    &mut self.settings.premium_license,
+                    "rrpc-lic1.…",
+                    w.max(120.0f32),
+                    !self.show_relay_key,
+                    false,
+                )
+                .changed();
+                let lbl = if self.show_relay_key { "Hide" } else { "Show" };
+                if theme::button_sized(ui, lbl, BtnKind::Ghost, 64.0f32, 34.0f32, 12.0f32).clicked() {
+                    self.show_relay_key = !self.show_relay_key;
+                }
+            });
+
+            ui.add_space(12.0f32);
+            ui.horizontal(|ui| {
+                let configured = self.settings.premium_configured();
+                ui.add_enabled_ui(configured && self.relay_test.is_none(), |ui| {
+                    if theme::button(ui, "Test connection", BtnKind::Primary, 140.0f32).clicked() {
+                        run_test = true;
+                    }
+                });
+                ui.add_enabled_ui(
+                    !self.settings.premium_license.is_empty() || self.settings.premium_url != transport::DEFAULT_PREMIUM_URL,
+                    |ui| {
+                        if theme::button(ui, "Clear", BtnKind::Ghost, 80.0f32).clicked() {
+                            clear = true;
+                        }
+                    },
+                );
+                if self.relay_test.is_some() {
+                    ui.spinner();
+                    ui.label(RichText::new("Testing…").size(12.5f32).color(C.accent_hover));
+                }
+            });
+
+            if let Some((ok, msg)) = &self.relay_test_result {
+                ui.add_space(10.0f32);
+                let c = if *ok { C.green } else { C.red };
+                theme::banner(c).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(msg).size(12.5f32).color(c));
+                });
+            }
+        });
+
+        ui.add_space(14.0f32);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_label(ui, "How it works");
+            ui.add_space(6.0f32);
+            for line in [
+                "1. Enter the relay URL and the licence key you were given, then press Test connection.",
+                "2. On Share this PC, set Connection to Premium and start sharing.",
+                "3. Copy the join code and send it, with the password, to whoever should connect.",
+                "4. They paste the join code on the Connect page (or in the Android app). They need no licence or settings.",
+                "The licence key stays on this PC. Join codes carry a short-lived pass instead, so a leaked code stops working on its own.",
+                "The licence key is stored on this PC in plain text.",
+            ] {
+                ui.label(RichText::new(line).size(12.0f32).color(C.text_dim));
+                ui.add_space(3.0f32);
+            }
+        });
+
+        if changed {
+            self.relay_test_result = None;
+            self.save_settings();
+        }
+        if clear {
+            self.settings.premium_license.clear();
+            self.settings.premium_url = transport::DEFAULT_PREMIUM_URL.to_string();
+            self.settings.premium_enabled = false;
+            self.relay_test_result = None;
+            self.save_settings();
+            self.toast("Premium settings cleared");
+        }
+        if run_test {
+            let mut s = self.settings.clone();
+            s.premium_enabled = true;
+            self.relay_test_result = None;
+            match s.host_relay() {
+                Ok(Some(p)) => {
+                    let (tx, rx) = oneshot::channel();
+                    self.relay_test = Some(rx);
+                    self.rt.spawn(async move {
+                        let _ = tx.send(transport::test_premium_relay(&p).await);
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => self.relay_test_result = Some((false, e)),
+            }
         }
     }
 }
@@ -1016,6 +1367,27 @@ impl UnifiedRemoteApp {
                                     }
                                 }
 
+                                if let Some(c) = &self.conn {
+                                    let link = c.link.lock().map(|l| l.clone()).unwrap_or_default();
+                                    ui.label(RichText::new(link).size(11.5f32).color(C.text_faint));
+                                }
+                                let mut qm = self.client_mode;
+                                egui::ComboBox::from_id_source("quality_mode")
+                                    .width(96.0f32)
+                                    .selected_text(qm.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in QualityMode::ALL {
+                                            ui.selectable_value(&mut qm, m, m.label());
+                                        }
+                                    });
+                                if qm != self.client_mode {
+                                    self.client_mode = qm;
+                                    if let Some(c) = &self.conn {
+                                        let _ = c.tx_quality.try_send(qm);
+                                    }
+                                    self.save_settings();
+                                }
+
                                 let sc = match self.scaling {
                                     Scaling::Fit => "Fit",
                                     Scaling::Stretch => "Fill",
@@ -1130,7 +1502,14 @@ fn fmt_duration(d: Duration) -> String {
 fn normalize_addr(raw: &str) -> Result<String, String> {
     let a = raw.trim();
     if a.is_empty() {
-        return Err("Enter the host address, for example 100.64.0.1:5885.".to_string());
+        return Err("Enter the join code or Pairing ID shown on the host, or an address like 100.64.0.1:5885.".to_string());
+    }
+    if transport::is_pairing_id(a) {
+        return Ok(a.to_ascii_lowercase());
+    }
+    if transport::is_join_code(a) {
+        // Validate now so a mistyped code gives an instant, clear error.
+        return transport::resolve_target(a).map(|_| a.to_string());
     }
     match a.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
@@ -1148,7 +1527,7 @@ fn friendly_error(e: &str) -> String {
     if l.contains("refused") {
         "Connection refused. Check that sharing is on at the host and the port is correct.".to_string()
     } else if l.contains("timed out") || l.contains("timeout") {
-        "Timed out. Check the address, and that both devices are on Tailscale.".to_string()
+        "Timed out. Check the Pairing ID or address, and that sharing is on at the host.".to_string()
     } else if l.contains("auth") || l.contains("password") {
         "Authentication failed. Check the password.".to_string()
     } else {

@@ -30,6 +30,11 @@ class ConnectionPreferences(context: Context) {
             if (rememberPassword) prefs.edit().putString("last_password", value).apply()
         }
 
+    /** Last chosen video quality mode (wire id). */
+    var qualityModeId: Int
+        get() = prefs.getInt("quality_mode", 0)
+        set(value) = prefs.edit().putInt("quality_mode", value).apply()
+
     fun getRecentHosts(): List<String> {
         val raw = prefs.getString("recent_hosts", "") ?: ""
         return if (raw.isBlank()) emptyList() else raw.split(",").filter { it.isNotBlank() }

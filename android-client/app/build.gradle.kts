@@ -24,6 +24,8 @@ android {
 
     buildTypes {
         release {
+            // Sideload build: signed with the local debug keystore so it installs directly.
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

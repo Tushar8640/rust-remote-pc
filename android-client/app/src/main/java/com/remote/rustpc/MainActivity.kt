@@ -15,7 +15,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.remote.rustpc.data.ConnectionPreferences
+import com.remote.rustpc.data.QualityMode
 import com.remote.rustpc.network.ConnectionState
+import com.remote.rustpc.network.IrohBridge
 import com.remote.rustpc.network.RemoteConnection
 import com.remote.rustpc.ui.screens.ConnectScreen
 import com.remote.rustpc.ui.screens.ViewerScreen
@@ -112,15 +114,21 @@ class MainActivity : ComponentActivity() {
                                     prefs.removeRecentHost(it)
                                     recents = prefs.getRecentHosts()
                                 },
-                                onConnect = { host, port, pass, rememberPw ->
+                                initialQuality = QualityMode.fromId(prefs.qualityModeId),
+                                onConnect = { host, port, pass, rememberPw, quality ->
                                     prefs.rememberPassword = rememberPw
                                     rememberPwState = rememberPw
-                                    prefs.lastHost = host
+                                    if (!IrohBridge.isJoinCode(host)) prefs.lastHost = host
                                     prefs.lastPort = port
                                     prefs.lastPassword = pass
-                                    prefs.addRecentHost(host)
+                                    prefs.qualityModeId = quality.id
+                                    // Join codes expire within a day, so do not keep them in the recent list.
+                                    if (!IrohBridge.isJoinCode(host)) prefs.addRecentHost(host)
                                     recents = prefs.getRecentHosts()
-                                    connection.connect(host, port, pass)
+                                    connection.connect(
+                                        host, port, pass,
+                                        quality = quality
+                                    )
                                 }
                             )
                         }

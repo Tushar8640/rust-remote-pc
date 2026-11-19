@@ -60,6 +60,10 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     private val _audioActive = MutableStateFlow(false)
     val audioActive: StateFlow<Boolean> = _audioActive.asStateFlow()
 
+    // Quality mode requested from the host (the UI observes this)
+    private val _qualityMode = MutableStateFlow(QualityMode.AUTO)
+    val qualityMode: StateFlow<QualityMode> = _qualityMode.asStateFlow()
+
     private val audioPlayer = AudioPlayer()
 
     private var socket: Socket? = null
@@ -73,7 +77,12 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     private var lastFpsTimestamp = System.currentTimeMillis()
     private var totalFrames = 0L
 
-    fun connect(host: String, port: Int, password: String) {
+    fun connect(
+        host: String,
+        port: Int,
+        password: String,
+        quality: QualityMode = QualityMode.AUTO
+    ) {
         val st = _connectionState.value
         if (st is ConnectionState.Connecting || st is ConnectionState.Authenticating || st is ConnectionState.Connected) {
             return
@@ -91,17 +100,43 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
 
         connectionJob = coroutineScope.launch(Dispatchers.IO) {
             try {
-                Log.d(tag, "Connecting to $host:$port...")
                 _connectionState.value = ConnectionState.Connecting
+
+                // A 64-character Pairing ID means "reach the PC over the internet":
+                // the native bridge dials it peer-to-peer and hands back a loopback
+                // port (+ a one-time secret) that speaks the same protocol as TCP.
+                var connectHost = host
+                var connectPort = port
+                var preamble: ByteArray? = null
+                val join = if (IrohBridge.isJoinCode(host)) {
+                    JoinCode.decode(host) ?: error("That join code is not valid. Copy it again from the PC.")
+                } else null
+                if (join != null || IrohBridge.isPairingId(host)) {
+                    Log.d(tag, "Connecting to ${IrohBridge.shorten(host)} over P2P...")
+                    val ep = if (join != null) {
+                        IrohBridge.connect(join.pairingId, join.relayUrl, join.pass)
+                    } else {
+                        IrohBridge.connect(host)
+                    }
+                    connectHost = "127.0.0.1"
+                    connectPort = ep.port
+                    preamble = ep.secret.toByteArray(Charsets.US_ASCII)
+                } else {
+                    Log.d(tag, "Connecting to $host:$port...")
+                }
 
                 val sock = Socket()
                 sock.tcpNoDelay = true
                 sock.soTimeout = 15000 // 15s handshake timeout
-                sock.connect(InetSocketAddress(host, port), 8000)
+                sock.connect(InetSocketAddress(connectHost, connectPort), 8000)
 
                 socket = sock
                 val out = BufferedOutputStream(sock.getOutputStream(), 64 * 1024)
                 val inp = BufferedInputStream(sock.getInputStream(), 256 * 1024)
+                if (preamble != null) {
+                    out.write(preamble)
+                    out.flush()
+                }
 
                 // 1. Send AuthRequest
                 _connectionState.value = ConnectionState.Authenticating
@@ -131,6 +166,10 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
                     responsePacket.screenWidth,
                     responsePacket.screenHeight
                 )
+
+                // Ask the host for the chosen quality mode before video starts flowing.
+                _qualityMode.value = quality
+                if (quality != QualityMode.AUTO) sendPacket(Packet.SetQuality(quality.id))
 
                 // Packet writer
                 val writerChannel = outgoingChannel
@@ -209,7 +248,7 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
 
     private fun friendlyError(e: Exception): String = when {
         e is ConnectException -> "Connection refused. Check that sharing is on at the PC and the port is correct."
-        e is SocketTimeoutException -> "Timed out. Check the address, and that both devices are on the same network or Tailscale."
+        e is SocketTimeoutException -> "Timed out. Check the Pairing ID or address, and that sharing is on at the PC."
         e is UnknownHostException -> "Unknown host. Check the address."
         e is NoRouteToHostException -> "No route to the PC. Are both devices on the same network or Tailscale?"
         e.message?.contains("Unexpected end of stream") == true -> "Connection lost. The PC stopped sharing."
@@ -252,6 +291,12 @@ class RemoteConnection(private val coroutineScope: CoroutineScope) {
     }
 
     // ── Input ──
+
+    /** Changes the video quality mode for the current session. */
+    fun setQuality(mode: QualityMode) {
+        _qualityMode.value = mode
+        sendPacket(Packet.SetQuality(mode.id))
+    }
 
     fun sendMouseMove(xRatio: Float, yRatio: Float) {
         sendPacket(Packet.Input(InputEvent.MouseMove(xRatio.coerceIn(0f, 1f), yRatio.coerceIn(0f, 1f))))

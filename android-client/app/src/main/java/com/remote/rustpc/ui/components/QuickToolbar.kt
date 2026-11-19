@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remote.rustpc.data.KeyCode
 import com.remote.rustpc.data.MouseBtn
+import com.remote.rustpc.data.QualityMode
 import com.remote.rustpc.network.RemoteConnection
 import com.remote.rustpc.ui.theme.*
 
@@ -100,6 +101,21 @@ fun QuickToolbar(
                         KeyChip("Scroll down") { connection.sendMouseScroll(0, -120) }
                         KeyChip("Reset zoom") { onResetZoom() }
                     }
+
+                    PanelLabel("Quality")
+                    val quality by connection.qualityMode.collectAsState()
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        QualityMode.entries.forEach { m ->
+                            KeyChip(
+                                text = if (m == quality) "✓ ${m.label}" else m.label,
+                                onClick = { connection.setQuality(m) }
+                            )
+                        }
+                    }
+                    Text(quality.hint, style = Typography.labelMedium.copy(color = TextFaint))
 
                     PanelLabel("Audio")
                     Row(

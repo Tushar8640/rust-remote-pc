@@ -1,0 +1,16 @@
+[package]
+name = "remote-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Android JNI bridge: exposes an iroh P2P stream to the Kotlin client as a loopback TCP port"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.104"
+getrandom = "0.2"
+hex = "0.4.3"
+iroh = "1.4.2"
+jni = "0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }

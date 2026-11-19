@@ -100,4 +100,19 @@ sealed class Packet(val variantIndex: Int) {
         val channels: Int,
         val data: ByteArray
     ) : Packet(7)
+
+    /** Ask the host to change the video quality mode (see [QualityMode]) for this session. */
+    data class SetQuality(val mode: Int) : Packet(8)
+}
+
+/** Video quality modes. The id is the byte sent on the wire (matches Rust `QualityMode`). */
+enum class QualityMode(val id: Int, val label: String, val hint: String) {
+    AUTO(0, "Auto", "Balanced, adapts to your connection"),
+    SMOOTH(1, "Smooth", "Lowest delay and highest frame rate"),
+    SHARP(2, "Sharp", "Best picture, may lower frame rate"),
+    SAVER(3, "Data saver", "Lowest data use, for mobile data");
+
+    companion object {
+        fun fromId(id: Int): QualityMode = entries.firstOrNull { it.id == id } ?: AUTO
+    }
 }

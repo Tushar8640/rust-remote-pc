@@ -101,6 +101,55 @@ pub enum Packet {
         channels: u16,
         data: Vec<u8>,
     },
+    /// Client asks the host to change the video quality mode for this session
+    /// (see [`QualityMode`]). Variant index 8; the Android client depends on it.
+    SetQuality { mode: u8 },
+}
+
+/// How the host trades image quality against smoothness. Sent as a single byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QualityMode {
+    /// Balanced, adapts to the link (default).
+    #[default]
+    Auto = 0,
+    /// Lowest latency and highest frame rate; quality drops first.
+    Smooth = 1,
+    /// Sharpest picture; tolerates a lower frame rate on slow links.
+    Sharp = 2,
+    /// Lowest bandwidth (half resolution); for mobile data.
+    DataSaver = 3,
+}
+
+impl QualityMode {
+    pub const ALL: [QualityMode; 4] = [Self::Auto, Self::Smooth, Self::Sharp, Self::DataSaver];
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Smooth,
+            2 => Self::Sharp,
+            3 => Self::DataSaver,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Smooth => "Smooth",
+            Self::Sharp => "Sharp",
+            Self::DataSaver => "Data saver",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "balanced" => Some(Self::Auto),
+            "smooth" | "fast" => Some(Self::Smooth),
+            "sharp" | "quality" => Some(Self::Sharp),
+            "saver" | "datasaver" | "data-saver" | "low" => Some(Self::DataSaver),
+            _ => None,
+        }
+    }
 }
 
 impl Packet {
@@ -136,6 +185,14 @@ mod tests {
         assert_eq!(&payload[8..10], &2u16.to_le_bytes());
         assert_eq!(&payload[10..18], &4u64.to_le_bytes()); // length prefix
         assert_eq!(&payload[18..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn set_quality_wire_layout() {
+        let b = Packet::SetQuality { mode: 2 }.to_bytes().unwrap();
+        assert_eq!(&b[4..8], &8u32.to_le_bytes()); // variant index
+        assert_eq!(&b[8..], &[2u8]);
+        assert_eq!(b.len(), 4 + 5);
     }
 
     /// bincode writes `char` as UTF-8, not as a 4-byte scalar.

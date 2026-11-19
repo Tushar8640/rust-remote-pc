@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Android Gradle ignores
 .gradle/
@@ -10,3 +9,12 @@ android-client/**/build/
 *.iml
 .idea/
 local.properties
+
+# Native bridge build output (see android-bridge/build-android.ps1)
+android-client/app/src/main/jniLibs/
+
+# Release artifacts (exe + apk)
+setup/
+
+# Relay server secrets
+relay-server/config.toml
